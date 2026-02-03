@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+out/
+cache/
+broadcast/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Foundry
+packages/contracts/cache/
+packages/contracts/out/
+packages/contracts/broadcast/
+
+# Test coverage
+coverage/
+lcov.info

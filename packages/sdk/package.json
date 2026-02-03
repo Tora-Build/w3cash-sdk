@@ -1,0 +1,53 @@
+{
+  "name": "w3cash",
+  "version": "0.1.0",
+  "description": "Economic workflows for autonomous agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.0"
+  },
+  "keywords": [
+    "agents",
+    "ai-agents",
+    "autonomous-agents",
+    "agentfi",
+    "economic-workflows",
+    "yield",
+    "dca",
+    "scheduled-transfers",
+    "web3",
+    "sdk"
+  ],
+  "author": "w3cash",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tora-Build/w3cash"
+  }
+}
