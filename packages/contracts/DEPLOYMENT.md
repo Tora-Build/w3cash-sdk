@@ -2,6 +2,22 @@
 
 This guide covers deploying w3cash contracts to Base Sepolia testnet.
 
+## Architecture Overview
+
+The POCA system uses **Option 4: Immutable Processor + Upgradeable Registry**:
+
+| Component | Trust Model | Upgrade Path |
+|-----------|-------------|--------------|
+| PocaProcessor | **Trustless** | None (immutable) |
+| AdapterRegistry | Admin-controlled | Can add new adapters |
+| Individual Adapters | **Trustless after freeze** | None once frozen |
+
+**Key Benefits:**
+- Core execution logic is immutable (no admin functions)
+- Adapters can be frozen for permanent immutability
+- New adapter IDs can still be added without touching processor
+- Gradual decentralization (owner → multisig → DAO)
+
 ## Prerequisites
 
 1. **Foundry installed**: https://book.getfoundry.sh/getting-started/installation
@@ -24,7 +40,50 @@ BASESCAN_API_KEY=your_api_key_for_verification
 
 ## Deployment Commands
 
-### Full Deployment
+### POCA Deployment (Recommended)
+
+Deploy the POCA architecture (AdapterRegistry + Adapters + PocaProcessor):
+
+```bash
+forge script script/DeployPoca.s.sol:DeployPoca \
+  --rpc-url base_sepolia \
+  --broadcast \
+  --verify
+```
+
+This deploys (in order):
+1. **AdapterRegistry** - Owned by deployer, manages adapter registration
+2. **PocaProcessor** - Immutable processor with registry reference
+3. **WaitAdapter** - Time/block/price conditions (requires processor address)
+4. **AaveAdapter** - Aave V3 lending operations (requires processor address)
+
+> **Note:** Adapters require the processor address in their constructor due to the `onlyProcessor` guard. This prevents direct calls that bypass signature verification.
+
+### Freeze Adapters (Production)
+
+After testing, freeze production adapters for immutability:
+
+```bash
+export ADAPTER_REGISTRY=0x...  # From deployment output
+forge script script/DeployPoca.s.sol:FreezeAdapters \
+  --rpc-url base_sepolia \
+  --broadcast
+```
+
+### Add New Adapter
+
+Add a new adapter to an existing registry:
+
+```bash
+export ADAPTER_REGISTRY=0x...
+export ADAPTER_ID=5
+export ADAPTER_ADDRESS=0x...
+forge script script/DeployPoca.s.sol:AddAdapter \
+  --rpc-url base_sepolia \
+  --broadcast
+```
+
+### Full Deployment (Legacy)
 
 Deploy all contracts (Processor, Factory, Paymaster, AaveAdapter):
 
@@ -64,6 +123,49 @@ forge script script/Deploy.s.sol:GrantSponsorship \
 ```
 
 ## Post-Deployment Steps
+
+### POCA Lifecycle
+
+1. **Bootstrap** - Deploy registry and adapters
+2. **Test** - Run on testnet, verify everything works
+3. **Freeze** - Call `freezeAdapter(id)` for each production adapter
+4. **Decentralize** - Transfer registry ownership to multisig/DAO
+
+### After POCA Deployment
+
+1. **Verify Deployment**
+   ```bash
+   # Check registry owner
+   cast call $ADAPTER_REGISTRY "owner()" --rpc-url base_sepolia
+
+   # Check adapter is registered
+   cast call $ADAPTER_REGISTRY "isAdapterRegistered(uint8)" 0 --rpc-url base_sepolia
+
+   # Check processor registry reference
+   cast call $POCA_PROCESSOR "registry()" --rpc-url base_sepolia
+   ```
+
+2. **Test Adapters**
+   ```bash
+   # Get fee estimate
+   cast call $POCA_PROCESSOR "estimateFee(uint8,uint8,uint112,uint256)" 0 0 1000000000000000000 100000 --rpc-url base_sepolia
+   ```
+
+3. **Freeze Production Adapters** (when ready)
+   ```bash
+   cast send $ADAPTER_REGISTRY "freezeAdapter(uint8)" 0 \
+     --rpc-url base_sepolia \
+     --private-key $PRIVATE_KEY
+   ```
+
+4. **Transfer Ownership** (optional, for decentralization)
+   ```bash
+   cast send $ADAPTER_REGISTRY "transferOwnership(address)" $MULTISIG_ADDRESS \
+     --rpc-url base_sepolia \
+     --private-key $PRIVATE_KEY
+   ```
+
+### Legacy Steps
 
 1. **Fund the Paymaster**
    ```bash
@@ -108,6 +210,17 @@ forge script script/Deploy.s.sol:GrantSponsorship \
 ### Deployed w3cash Contracts
 
 Update this section after deployment:
+
+**POCA Architecture (Option 4):**
+
+| Contract | Address | Trust Model |
+|----------|---------|-------------|
+| AdapterRegistry | `TBD` | Admin until frozen |
+| PocaProcessor | `TBD` | **Immutable** |
+| WaitAdapter (ID: 0) | `TBD` | Trustless after freeze |
+| AaveAdapter (ID: 1) | `TBD` | Trustless after freeze |
+
+**Legacy Contracts:**
 
 | Contract | Address |
 |----------|---------|

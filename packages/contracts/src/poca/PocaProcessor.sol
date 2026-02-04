@@ -1,42 +1,60 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import { IAdapterRegistry } from "./interfaces/IAdapterRegistry.sol";
 import { IAdapter } from "./adapters/interfaces/IAdapter.sol";
 import { DataTypes } from "./utils/DataTypes.sol";
 import { Errors } from "./utils/Errors.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { IERC20 } from "@openzeppelin/contracts/interfaces/IERC20.sol";
 
 /**
  * @title PocaProcessor
  * @notice Protocol Oriented Chain Abstraction - Core processor for resumable workflows
  * @dev Executes signed payloads with PAUSE_EXECUTION support for conditional/scheduled actions
- * 
+ *
  * Key features:
  * - SignedPayload verification (user signs once, execution can happen later)
  * - PAUSE_EXECUTION pattern (non-reverting condition checks)
  * - Adapter-based architecture (WaitAdapter, SwapAdapter, etc.)
  * - Cross-chain support via AMB adapters
+ *
+ * Trust Model:
+ * - This contract is IMMUTABLE (no admin functions, no Ownable)
+ * - Cross-chain: AMB adapter and chain lookups go through AdapterRegistry
+ * - Local: Adapter addresses are user-specified in signed payloads (user's authorization)
+ * - Security depends on user signatures + registry's freeze mechanism
+ * - See docs/POCA_SECURITY_MODEL.md for full trust model
  */
-contract PocaProcessor is Ownable {
+contract PocaProcessor {
     using ECDSA for bytes32;
 
-    // --- State ---
-    mapping(uint8 => IAdapter) public adapters;
-    mapping(uint8 => uint256) public chains;
+    // --- Immutable State ---
+
+    /// @notice External registry for adapter and chain lookups (set once at deploy)
+    IAdapterRegistry public immutable registry;
+
+    // --- Mutable State ---
+
+    /// @notice Authorized cross-chain endpoints (for receiving messages)
     mapping(bytes32 => bool) public authorizedEndpoints;
 
     // --- Events ---
     event WorkflowPaused(uint256 seq, bytes32 payloadHash);
     event LocalCommandProcessed(uint256 seq, bytes32 payloadHash);
     event CrossChainMessageSent(bytes instruction);
-    event AdapterSet(uint8 indexed amb, address adapter);
-    event ChainSet(uint8 indexed chain, uint256 chainId);
 
     // --- Constructor ---
-    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    /**
+     * @notice Deploy immutable processor with registry reference
+     * @param _registry AdapterRegistry contract address
+     */
+    constructor(address _registry) {
+        require(_registry != address(0), "Invalid registry");
+        registry = IAdapterRegistry(_registry);
+    }
 
     receive() external payable {}
 
@@ -57,29 +75,31 @@ contract PocaProcessor is Ownable {
 
     /**
      * @notice Get fee estimate for cross-chain execution
+     * @param amb AMB adapter ID
+     * @param chain Target chain index
+     * @param value Value to send
+     * @param gasLimit Gas limit for execution
+     * @return Fee estimate in native currency
      */
     function estimateFee(
-        uint8 amb, 
-        uint8 chain, 
-        uint112 value, 
+        uint8 amb,
+        uint8 chain,
+        uint112 value,
         uint256 gasLimit
     ) external view returns (uint256) {
-        return adapters[amb].estimateFee(chain, value, gasLimit);
+        return registry.getAdapter(amb).estimateFee(chain, value, gasLimit);
     }
 
-    // --- Admin Functions ---
-
-    function setAdapter(uint8 amb, address adapter) external onlyOwner {
-        adapters[amb] = IAdapter(adapter);
-        emit AdapterSet(amb, adapter);
-    }
-
-    function setChain(uint8 chain, uint256 chainId) external onlyOwner {
-        chains[chain] = chainId;
-        emit ChainSet(chain, chainId);
-    }
-
-    function setAuthorizedEndpoint(bytes32 endpoint, bool authorized) external onlyOwner {
+    /**
+     * @notice Set authorized endpoint for cross-chain message reception
+     * @dev This is the only mutable state - required for cross-chain security
+     * @param endpoint Endpoint hash to authorize/deauthorize
+     * @param authorized Whether the endpoint is authorized
+     */
+    function setAuthorizedEndpoint(bytes32 endpoint, bool authorized) external {
+        // Only the registry owner can set authorized endpoints
+        // This maintains admin control for cross-chain security while keeping processor immutable
+        require(msg.sender == registry.owner(), "Only registry owner");
         authorizedEndpoints[endpoint] = authorized;
     }
 
@@ -122,7 +142,7 @@ contract PocaProcessor is Ownable {
                 (uint8, uint8, uint64, address, bytes8, uint112)
             );
 
-            if (chains[chain] != block.chainid) {
+            if (registry.getChain(chain) != block.chainid) {
                 // Cross-chain: forward to AMB adapter
                 _sendCrossChainMessage(
                     instruction, initiator, signature, 
@@ -169,7 +189,7 @@ contract PocaProcessor is Ownable {
         });
         
         bytes memory dataToSend = abi.encode(sp);
-        adapters[amb].send{value: msg.value}(dataToSend, chain, fee, value);
+        registry.getAdapter(amb).send{value: msg.value}(dataToSend, chain, fee, value);
     }
 
     // --- Encoding/Decoding Helpers ---

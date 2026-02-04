@@ -37,6 +37,7 @@ contract AaveAdapter is IAdapter {
     error AaveAdapter__ZeroAmount();
     error AaveAdapter__InsufficientBalance();
     error AaveAdapter__TransferFailed();
+    error AaveAdapter__CallerNotProcessor();
 
     /*//////////////////////////////////////////////////////////////
                                 CONSTANTS
@@ -57,17 +58,32 @@ contract AaveAdapter is IAdapter {
     /// @notice The Aave V3 Pool contract
     IAavePool public immutable pool;
 
+    /// @notice The authorized Processor contract
+    address public immutable processor;
+
     /// @notice Mapping of underlying token to aToken
     mapping(address => address) public aTokens;
+
+    /*//////////////////////////////////////////////////////////////
+                               MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Restricts calls to the Processor contract only
+    modifier onlyProcessor() {
+        if (msg.sender != processor) revert AaveAdapter__CallerNotProcessor();
+        _;
+    }
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Initialize the adapter with the Aave V3 Pool
+    /// @notice Initialize the adapter with the Aave V3 Pool and Processor
     /// @param _pool The Aave V3 Pool address
-    constructor(address _pool) {
+    /// @param _processor The authorized Processor address
+    constructor(address _pool, address _processor) {
         pool = IAavePool(_pool);
+        processor = _processor;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -92,7 +108,7 @@ contract AaveAdapter is IAdapter {
     }
 
     /// @inheritdoc IAdapter
-    function execute(address account, bytes calldata data) external payable override returns (bytes memory result) {
+    function execute(address account, bytes calldata data) external payable override onlyProcessor returns (bytes memory result) {
         if (data.length < 4) revert AaveAdapter__InvalidOperation();
 
         bytes4 operation = bytes4(data[:4]);

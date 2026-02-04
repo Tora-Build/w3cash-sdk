@@ -31,15 +31,32 @@ contract WaitAdapter is IAdapter {
         int256 targetPrice;  // For PRICE conditions
     }
 
+    // --- Errors ---
+    error CallerNotProcessor();
+
     // --- Constants ---
     bytes4 public constant ADAPTER_ID = bytes4(keccak256("WaitAdapter"));
+
+    // --- State ---
+    address public immutable processor;
+
+    // --- Modifiers ---
+    modifier onlyProcessor() {
+        if (msg.sender != processor) revert CallerNotProcessor();
+        _;
+    }
+
+    // --- Constructor ---
+    constructor(address _processor) {
+        processor = _processor;
+    }
 
     // --- IAdapter Implementation ---
 
     function execute(
         address, // initiator (unused)
         bytes calldata data
-    ) external payable override returns (bytes memory) {
+    ) external payable override onlyProcessor returns (bytes memory) {
         WaitParams memory params = abi.decode(data, (WaitParams));
 
         bool conditionMet = false;
