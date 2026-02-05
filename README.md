@@ -1,70 +1,91 @@
-# w3cash
+# W3Cash SDK
 
-**Economic workflows for autonomous agents.**
+On-chain automation for AI agents. Build intents with actions + conditions, sign once, execute later.
 
-Agents need more than wallets. w3cash gives agents yield, DCA, scheduled transfers, and conditional execution.
-
-## Installation
+## Quick Start
 
 ```bash
 npm install w3cash
 ```
 
-## Quick Start
-
 ```typescript
-import { W3cash } from 'w3cash';
+import { W3cash, ADAPTERS } from 'w3cash';
 
 const w3 = new W3cash({ chain: 'base-sepolia' });
-await w3.connect(agentWallet);
+w3.connect(walletAccount);
 
-// Earn yield on idle funds
-await w3.flow('yield').deposit(USDC, amount);
+// Build intent: transfer USDC when balance is sufficient
+const intent = w3.intent()
+  .transfer({ token: USDC, to: recipient, amount: 100n * 10n**6n })
+  .whenBalance(USDC, myAddress, '>=', 100n * 10n**6n)
+  .build(ADAPTERS['base-sepolia']);
 
-// Set up weekly DCA
-await w3.flow('dca').createDCA({
-  tokenIn: USDC,
-  tokenOut: WETH,
-  amountPerInterval: parseUnits('100', 6),
-  interval: 7n * 24n * 60n * 60n,
-  totalExecutions: 52n,
-});
-
-// Schedule a transfer
-await w3.flow('scheduled').createTimeSchedule({
-  token: USDC,
-  recipient: '0x...',
-  amount: parseUnits('1000', 6),
-  executeAt: BigInt(Date.parse('2026-03-01') / 1000),
-});
+// Sign and execute
+const signed = await w3.sign(intent);
+await w3.execute(signed);
 ```
 
-## Flows
+## What is W3Cash?
 
-| Flow | Type | Description |
-|------|------|-------------|
-| `yield` | Instant | Deposit to Aave V3, earn yield |
-| `swap` | Instant | Token swaps via Uniswap V3 |
-| `x402` | Instant | HTTP-native payments |
-| `dca` | Workflow | Dollar-cost averaging |
-| `scheduled` | Workflow | Time/price triggered transfers |
+W3Cash is an on-chain automation layer. Agent expresses need → W3Cash provides solution.
 
-## Contracts (Base Sepolia)
+- **Actions** — What to do (swap, transfer, yield, bridge, stake, vote...)
+- **Conditions** — When to do it (time, price, balance, health factor...)
+- **Intents** — Actions + Conditions, signed once, executed when ready
+
+## Deployed Contracts (Base Sepolia)
 
 | Contract | Address |
 |----------|---------|
-| W3CashCore | `0x82c2B342757A9DfD7e4C4F750521df72C86E4dDD` |
-| YieldFlow | `0x026Ce3Aed0199b7Ed053287B49066815A519891C` |
-| DCAFlow | `0x7fCC5416b10b3f01920C9AB974e9C4116e4dc6ae` |
-| ScheduledFlow | `0xD393C92Bc53D936D8eD802896f872f4a007EEc98` |
-| x402Flow | `0x799224988457e60F8436b3a46f604070940F495C` |
-| SwapFlow | `0x1ba08495bd89e82043b439d72de49b42603282f1` |
+| W3CashProcessor | `0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE` |
+| AdapterRegistry | `0x2E9e3AC48af39Fe96EbB5b71075FA847795B7A82` |
 
-## Documentation
+### Adapters (50 total, 30 deployed)
 
-- [SDK Documentation](./packages/sdk/README.md)
-- [Contract Documentation](./packages/contracts/README.md)
-- [Website](https://w3.cash)
+**Conditions:** Wait, Query, Balance, Allowance, Price, HealthFactor, Signature, GasPrice, TimeRange
+
+**Actions:** Aave, Transfer, Approve, Swap, Wrap, Bridge, Borrow, Repay, Delegate, Vote, Claim, Burn, Mint, Lock, Unwrap, FlashLoan, AddLiquidity, RemoveLiquidity, Liquidate, Batch, Stake + 20 more ready to deploy
+
+## Repository Structure
+
+```
+w3cash-sdk/
+├── packages/
+│   ├── contracts/     # Solidity contracts (Foundry)
+│   │   └── src/w3cash/
+│   │       ├── W3CashProcessor.sol
+│   │       ├── AdapterRegistry.sol
+│   │       └── adapters/        # 50 adapter contracts
+│   └── sdk/           # TypeScript SDK
+│       └── src/
+│           ├── W3cash.ts
+│           └── intent/          # Intent builder
+├── skills/
+│   └── w3cash/
+│       └── SKILL.md   # AI agent skill reference
+└── docs/
+    └── WHITEPAPER_V4.md
+```
+
+## For AI Agents
+
+See [`skills/w3cash/SKILL.md`](skills/w3cash/SKILL.md) for the complete agent reference.
+
+## Use Cases
+
+- **DCA** — Buy tokens at regular intervals
+- **Stop Loss** — Sell when price drops below threshold
+- **Conditional Yield** — Deposit when balance reaches threshold
+- **Scheduled Payments** — Pay rent on the 1st of each month
+- **Auto-Compound** — Claim rewards and reinvest
+- **Emergency Exit** — Withdraw if health factor drops
+
+## Links
+
+- **Website:** https://w3.cash
+- **Docs:** https://w3.cash/#/docs
+- **Skill:** https://w3.cash/#/skill
+- **GitHub:** https://github.com/Tora-Build/w3cash-sdk
 
 ## License
 

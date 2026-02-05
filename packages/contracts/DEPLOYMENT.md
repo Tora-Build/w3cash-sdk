@@ -4,11 +4,11 @@ This guide covers deploying w3cash contracts to Base Sepolia testnet.
 
 ## Architecture Overview
 
-The POCA system uses **Option 4: Immutable Processor + Upgradeable Registry**:
+The W3Cash system uses **Option 4: Immutable Processor + Upgradeable Registry**:
 
 | Component | Trust Model | Upgrade Path |
 |-----------|-------------|--------------|
-| PocaProcessor | **Trustless** | None (immutable) |
+| W3CashProcessor | **Trustless** | None (immutable) |
 | AdapterRegistry | Admin-controlled | Can add new adapters |
 | Individual Adapters | **Trustless after freeze** | None once frozen |
 
@@ -40,9 +40,9 @@ BASESCAN_API_KEY=your_api_key_for_verification
 
 ## Deployment Commands
 
-### POCA Deployment (Recommended)
+### W3Cash Deployment (Recommended)
 
-Deploy the POCA architecture (AdapterRegistry + Adapters + PocaProcessor):
+Deploy the W3Cash architecture (AdapterRegistry + Adapters + W3CashProcessor):
 
 ```bash
 forge script script/DeployPoca.s.sol:DeployPoca \
@@ -53,7 +53,7 @@ forge script script/DeployPoca.s.sol:DeployPoca \
 
 This deploys (in order):
 1. **AdapterRegistry** - Owned by deployer, manages adapter registration
-2. **PocaProcessor** - Immutable processor with registry reference
+2. **W3CashProcessor** - Immutable processor with registry reference
 3. **WaitAdapter** - Time/block/price conditions (requires processor address)
 4. **AaveAdapter** - Aave V3 lending operations (requires processor address)
 
@@ -124,14 +124,14 @@ forge script script/Deploy.s.sol:GrantSponsorship \
 
 ## Post-Deployment Steps
 
-### POCA Lifecycle
+### W3Cash Lifecycle
 
 1. **Bootstrap** - Deploy registry and adapters
 2. **Test** - Run on testnet, verify everything works
 3. **Freeze** - Call `freezeAdapter(id)` for each production adapter
 4. **Decentralize** - Transfer registry ownership to multisig/DAO
 
-### After POCA Deployment
+### After W3Cash Deployment
 
 1. **Verify Deployment**
    ```bash
@@ -142,13 +142,13 @@ forge script script/Deploy.s.sol:GrantSponsorship \
    cast call $ADAPTER_REGISTRY "isAdapterRegistered(uint8)" 0 --rpc-url base_sepolia
 
    # Check processor registry reference
-   cast call $POCA_PROCESSOR "registry()" --rpc-url base_sepolia
+   cast call $W3Cash_PROCESSOR "registry()" --rpc-url base_sepolia
    ```
 
 2. **Test Adapters**
    ```bash
    # Get fee estimate
-   cast call $POCA_PROCESSOR "estimateFee(uint8,uint8,uint112,uint256)" 0 0 1000000000000000000 100000 --rpc-url base_sepolia
+   cast call $W3Cash_PROCESSOR "estimateFee(uint8,uint8,uint112,uint256)" 0 0 1000000000000000000 100000 --rpc-url base_sepolia
    ```
 
 3. **Freeze Production Adapters** (when ready)
@@ -211,14 +211,20 @@ forge script script/Deploy.s.sol:GrantSponsorship \
 
 Update this section after deployment:
 
-**POCA Architecture (Option 4):**
+**W3Cash v4 Architecture (Base Sepolia):**
 
 | Contract | Address | Trust Model |
 |----------|---------|-------------|
-| AdapterRegistry | `TBD` | Admin until frozen |
-| PocaProcessor | `TBD` | **Immutable** |
-| WaitAdapter (ID: 0) | `TBD` | Trustless after freeze |
-| AaveAdapter (ID: 1) | `TBD` | Trustless after freeze |
+| AdapterRegistry | `0x2E9e3AC48af39Fe96EbB5b71075FA847795B7A82` | Admin until frozen |
+| W3CashProcessor | `0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE` | **Immutable** |
+| WaitAdapter (ID: 0) | `0x8448b5f4abD40830C3B980390AbcfD2822719061` | Trustless after freeze |
+| QueryAdapter (ID: 1) | `0x4bC2F784CC76989dA6760Bc6bFCDc3F75c49ee9F` | Trustless after freeze |
+| AaveAdapter (ID: 2) | `0xC330e841A259E8211D1Ea84c60efD8657DB1D546` | Trustless after freeze |
+| TransferAdapter (ID: 3) | `0x6cA85B548d3512E355B63Fb390dBD197CF72d5eA` | Trustless after freeze |
+| ApproveAdapter (ID: 4) | `0x1ff4459D35E956BA999ECf80C20Ad559904398A0` | Trustless after freeze |
+| SwapAdapter (ID: 5) | `0x9952735758c18d00D3cf2D1D0985A93b265a2126` | Trustless after freeze |
+| WrapAdapter (ID: 6) | `0xD9142Ae0fCf4Fe81b39cD196BC37C9675DC86516` | Trustless after freeze |
+| BridgeAdapter (ID: 7) | `0x3502362cAB171ffF2bF094fC70FD5977c9AD7090` | Trustless after freeze |
 
 **Legacy Contracts:**
 

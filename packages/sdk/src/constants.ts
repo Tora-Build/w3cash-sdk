@@ -6,27 +6,43 @@ export const CHAINS = {
   'base': base,
 } as const;
 
-// Contract addresses
+// Contract addresses - W3Cash v4
 export const CONTRACTS = {
   'base-sepolia': {
-    core: '0x82c2B342757A9DfD7e4C4F750521df72C86E4dDD' as const,
-    flows: {
-      x402: '0x799224988457e60F8436b3a46f604070940F495C' as const,
-      yield: '0x026Ce3Aed0199b7Ed053287B49066815A519891C' as const,
-      swap: '0x1ba08495bd89e82043b439d72de49b42603282f1' as const,
-      scheduled: '0xD393C92Bc53D936D8eD802896f872f4a007EEc98' as const,
-      dca: '0x7fCC5416b10b3f01920C9AB974e9C4116e4dc6ae' as const,
-    },
+    core: '0x82c2B342757A9DfD7e4C4F750521df72C86E4dDD' as const, // Legacy W3CashCore
+    processor: '0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE' as const,
+    registry: '0x2E9e3AC48af39Fe96EbB5b71075FA847795B7A82' as const,
   },
   'base': {
-    core: '0x0000000000000000000000000000000000000000' as const, // Not deployed yet
-    flows: {
-      x402: '0x0000000000000000000000000000000000000000' as const,
-      yield: '0x0000000000000000000000000000000000000000' as const,
-      swap: '0x0000000000000000000000000000000000000000' as const,
-      scheduled: '0x0000000000000000000000000000000000000000' as const,
-      dca: '0x0000000000000000000000000000000000000000' as const,
-    },
+    core: '0x0000000000000000000000000000000000000000' as const,
+    processor: '0x0000000000000000000000000000000000000000' as const,
+    registry: '0x0000000000000000000000000000000000000000' as const,
+  },
+} as const;
+
+// Adapter addresses - W3Cash v4 (Base Sepolia)
+export const ADAPTERS = {
+  'base-sepolia': {
+    // Conditions
+    wait: '0x8448b5f4abD40830C3B980390AbcfD2822719061' as const,     // ID: 0
+    query: '0x4bC2F784CC76989dA6760Bc6bFCDc3F75c49ee9F' as const,    // ID: 1
+    // Actions
+    aave: '0xC330e841A259E8211D1Ea84c60efD8657DB1D546' as const,     // ID: 2
+    transfer: '0x6cA85B548d3512E355B63Fb390dBD197CF72d5eA' as const, // ID: 3
+    approve: '0x1ff4459D35E956BA999ECf80C20Ad559904398A0' as const,  // ID: 4
+    swap: '0x9952735758c18d00D3cf2D1D0985A93b265a2126' as const,     // ID: 5
+    wrap: '0xD9142Ae0fCf4Fe81b39cD196BC37C9675DC86516' as const,     // ID: 6
+    bridge: '0x3502362cAB171ffF2bF094fC70FD5977c9AD7090' as const,   // ID: 7 (Across)
+  },
+  'base': {
+    wait: '0x0000000000000000000000000000000000000000' as const,
+    query: '0x0000000000000000000000000000000000000000' as const,
+    aave: '0x0000000000000000000000000000000000000000' as const,
+    transfer: '0x0000000000000000000000000000000000000000' as const,
+    approve: '0x0000000000000000000000000000000000000000' as const,
+    swap: '0x0000000000000000000000000000000000000000' as const,
+    wrap: '0x0000000000000000000000000000000000000000' as const,
+    bridge: '0x0000000000000000000000000000000000000000' as const,
   },
 } as const;
 
@@ -71,131 +87,6 @@ export const CORE_ABI = [
       { name: 'caller', type: 'address', indexed: true },
       { name: 'flow', type: 'address', indexed: true },
       { name: 'success', type: 'bool', indexed: false },
-    ],
-  },
-] as const;
-
-export const X402_ABI = [
-  {
-    type: 'function',
-    name: 'pay',
-    inputs: [
-      { name: 'to', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-      { name: 'token', type: 'address' },
-      { name: 'resourceId', type: 'bytes32' },
-    ],
-    outputs: [{ name: 'paymentId', type: 'bytes32' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'payEth',
-    inputs: [
-      { name: 'to', type: 'address' },
-      { name: 'resourceId', type: 'bytes32' },
-    ],
-    outputs: [{ name: 'paymentId', type: 'bytes32' }],
-    stateMutability: 'payable',
-  },
-  {
-    type: 'function',
-    name: 'verify',
-    inputs: [{ name: 'paymentId', type: 'bytes32' }],
-    outputs: [
-      { name: 'exists', type: 'bool' },
-      {
-        name: 'receipt',
-        type: 'tuple',
-        components: [
-          { name: 'from', type: 'address' },
-          { name: 'to', type: 'address' },
-          { name: 'token', type: 'address' },
-          { name: 'amount', type: 'uint256' },
-          { name: 'resourceId', type: 'bytes32' },
-          { name: 'timestamp', type: 'uint256' },
-        ],
-      },
-    ],
-    stateMutability: 'view',
-  },
-  {
-    type: 'event',
-    name: 'Payment',
-    inputs: [
-      { name: 'paymentId', type: 'bytes32', indexed: true },
-      { name: 'from', type: 'address', indexed: true },
-      { name: 'to', type: 'address', indexed: true },
-      { name: 'token', type: 'address', indexed: false },
-      { name: 'amount', type: 'uint256', indexed: false },
-      { name: 'resourceId', type: 'bytes32', indexed: false },
-    ],
-  },
-] as const;
-
-export const YIELD_ABI = [
-  {
-    type: 'function',
-    name: 'deposit',
-    inputs: [
-      { name: 'token', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-    ],
-    outputs: [
-      { name: 'success', type: 'bool' },
-      { name: 'deposited', type: 'uint256' },
-    ],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'withdraw',
-    inputs: [
-      { name: 'token', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-    ],
-    outputs: [
-      { name: 'success', type: 'bool' },
-      { name: 'withdrawn', type: 'uint256' },
-    ],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'withdrawAll',
-    inputs: [{ name: 'token', type: 'address' }],
-    outputs: [
-      { name: 'success', type: 'bool' },
-      { name: 'withdrawn', type: 'uint256' },
-    ],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'balance',
-    inputs: [
-      { name: 'token', type: 'address' },
-      { name: 'account', type: 'address' },
-    ],
-    outputs: [{ name: 'balance', type: 'uint256' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'event',
-    name: 'Deposited',
-    inputs: [
-      { name: 'caller', type: 'address', indexed: true },
-      { name: 'token', type: 'address', indexed: true },
-      { name: 'amount', type: 'uint256', indexed: false },
-    ],
-  },
-  {
-    type: 'event',
-    name: 'Withdrawn',
-    inputs: [
-      { name: 'caller', type: 'address', indexed: true },
-      { name: 'token', type: 'address', indexed: true },
-      { name: 'amount', type: 'uint256', indexed: false },
     ],
   },
 ] as const;

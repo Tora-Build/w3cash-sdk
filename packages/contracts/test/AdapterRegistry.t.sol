@@ -2,9 +2,9 @@
 pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { AdapterRegistry } from "../src/poca/AdapterRegistry.sol";
-import { IAdapterRegistry } from "../src/poca/interfaces/IAdapterRegistry.sol";
-import { IAdapter } from "../src/poca/adapters/interfaces/IAdapter.sol";
+import { AdapterRegistry } from "../src/w3cash/AdapterRegistry.sol";
+import { IAdapterRegistry } from "../src/w3cash/interfaces/IAdapterRegistry.sol";
+import { IAdapter } from "../src/w3cash/adapters/interfaces/IAdapter.sol";
 
 /// @dev Mock adapter for testing
 contract MockAdapter is IAdapter {
