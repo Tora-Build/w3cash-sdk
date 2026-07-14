@@ -1,0 +1,27 @@
+[Unit]
+Description=W3Cash Intent Compiler — A2MCP ASP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to match the deploy location.
+User=www-data
+WorkingDirectory=/opt/w3cash-asp
+# Runs the compiled server (npm run build produces dist/server.js).
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=4000
+# Secrets (phase-2 x402) come from an env file, NOT the repo. Leave absent in phase-1.
+EnvironmentFile=-/opt/w3cash-asp/.env
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/w3cash-asp
+
+[Install]
+WantedBy=multi-user.target

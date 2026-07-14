@@ -75,12 +75,20 @@ async function main() {
   const nonce = await publicClient.readContract({
     address: PROCESSOR, abi: processorAbi, functionName: "nonces", args: [account.address],
   });
+  // Optional gate: WAIT_UNTIL=<unix ts>. A past timestamp is already satisfied
+  // (executes now, proving the condition path); a future one pauses on-chain.
+  const waitUntil = process.env.WAIT_UNTIL ? Number(process.env.WAIT_UNTIL) : undefined;
+  const conditions = waitUntil
+    ? [{ type: "waitTime" as const, timestamp: waitUntil }]
+    : [];
   const intent = compileIntent({
     chain: CHAIN_ID,
     initiator: account.address,
     nonce: Number(nonce),
+    conditions,
     actions: [{ type: "transfer", token: USDC, to: RECIPIENT, amount: AMOUNT.toString() }],
   });
+  if (waitUntil) console.log(`condition: wait until unix ${waitUntil} (gate before transfer)`);
   console.log(`compiled intent — payloadHash: ${intent.payloadHash}`);
   console.log(`  toSign: ${intent.toSign}`);
   intent.humanSummary.forEach((l) => console.log(`  ${l}`));
