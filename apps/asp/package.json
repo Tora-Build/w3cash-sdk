@@ -1,0 +1,26 @@
+{
+  "name": "@w3cash/asp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "W3Cash Intent Compiler — A2MCP ASP for OKX.AI (OnchainOS)",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.9"
+  }
+}
