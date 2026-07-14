@@ -5,16 +5,20 @@ request into a **signable W3Cash intent** for the `W3CashProcessor` on **Base
 Sepolia (chainId 84532)**. It returns the exact 32-byte message the initiator must
 sign — **it never signs, never holds keys, and never broadcasts.**
 
-- **Phase-1: free.** The endpoint is unauthenticated and free today. x402 payments
-  are a later phase; the OKX/`NETWORK`/`PAY_TO_ADDRESS` vars in `.env.example` are
-  reserved for that phase and are unused now (the server reads only `PORT`).
+- **Free by default; x402-ready.** The endpoint is free and unauthenticated out of the
+  box. A pay-per-call **x402** tier (0.01 USD₮0 on X Layer) is fully wired and one flag
+  away: set `X402_ENABLED=true` with the OKX/`NETWORK`/`PAY_TO_ADDRESS` vars from
+  `.env.example` and `POST /compile-intent` returns an `HTTP 402 PAYMENT-REQUIRED`
+  challenge (see `src/x402.ts`).
 
 ## What this is (the A2MCP model)
 
 **A2MCP** = *Agent-to-Agent Model Context Protocol*: a marketplace agent (e.g. OKX
 OnchainOS) calls this service as a *tool* over plain HTTP+JSON to obtain onchain
 capabilities it doesn't implement itself. This ASP (Agent Service Provider) exposes
-exactly one capability — **compile a W3Cash intent** — plus discovery/health probes:
+one core capability — **compile a W3Cash intent** (8 action types × 12 condition types
+over 11 on-chain-verified adapters) — plus discovery (`/capabilities`, `/recipes`) and
+health probes:
 
 ```
   ┌────────────────────┐     POST /compile-intent      ┌──────────────────────┐
@@ -75,6 +79,16 @@ catalog (with `deployed` flags).
 
 ```bash
 curl localhost:4000/capabilities
+```
+
+### `GET /recipes`
+
+Ready-to-POST request bodies for common automations (DCA, buy-the-dip, Aave
+stop-loss, cross-chain sweep, prediction-gated withdraw), plus the replay/cancel
+caveat as a first-class field.
+
+```bash
+curl localhost:4000/recipes
 ```
 
 ### `POST /compile-intent`
@@ -180,6 +194,7 @@ means the initiator must `approve(adapter, …)` the relevant token **to the ada
 | `aaveWithdraw` | AaveAdapter | `token, amount, value?` | yes — of the aToken (selector `0xf3fef3a3`) |
 | `aaveWithdrawAll` | AaveAdapter | `token, value?` | yes — of the aToken (selector `0xfa09e630`) |
 | `wrap` | WrapAdapter | `isWrap, amount, value?` | `isWrap=false` (WETH→ETH) needs prior WETH approve; `isWrap=true` forwards ETH via `value` (defaults to `amount`) |
+| `bridge` | BridgeAdapter | `recipient, destinationChainId, inputToken, outputToken?, inputAmount, outputAmount, quoteTimestamp, fillDeadline, exclusivityDeadline?, message?, value?` | yes — of `inputToken`. Across `depositV3`, ERC20-only. `outputAmount`/`quoteTimestamp` are **caller-supplied** — fetch an Across suggested-fees quote; stale values won't fill on-chain |
 
 ## Supported conditions
 
@@ -189,9 +204,14 @@ means the initiator must `approve(adapter, …)` the relevant token **to the ada
 | `waitBlock` | WaitAdapter | `blockNumber` | met when `block.number >= blockNumber` |
 | `waitPriceGte` | WaitAdapter | `feed, targetPrice` | Chainlink price `>= targetPrice` (no staleness check) |
 | `waitPriceLte` | WaitAdapter | `feed, targetPrice` | Chainlink price `<= targetPrice` (no staleness check) |
-| `balance` | BalanceAdapter | `token?, target, operator, threshold` | `token` omitted/zero ⇒ native ETH balance. **NOT deployed** (see below) |
-| `price` | PriceAdapter | `feed, operator, targetPrice, checkStaleness?` | signed Chainlink compare. **NOT deployed** (see below) |
+| `balance` | QueryAdapter | `token, target, operator, threshold` | `balanceOf(target)` compare. Native ETH (no `token`) is rejected — use a WETH balance instead |
+| `price` | QueryAdapter | `feed, operator, targetPrice, checkStaleness?` | Chainlink `latestAnswer()` compare (unsigned; negative prices rejected) |
 | `query` | QueryAdapter | `target, calldata, operator, expected` | `staticcall(target, calldata)` decoded as a single `uint256`, compared unsigned |
+| `timeRange` | TimeRangeAdapter | `startTime, endTime, recurring` | one-time absolute window, or (`recurring`) a daily UTC hour window with overnight wrap |
+| `gasPrice` | GasPriceAdapter | `operator, threshold` | gate on `tx.gasprice` vs a wei threshold |
+| `signature` | SignatureAdapter | `requiredSigner, actionHash, deadline, signature` | **2nd-approver gate** — a co-signer's ECDSA approval with replay protection + deadline; makes an intent single-use (mitigates the replay caveat). Use the exported `signatureMessageHash` helper for what to sign |
+| `marketResolved` | QueryAdapter | `market` | met once a **Sooth `TruthMarket`** `isSettled()` — gate an intent on a prediction market resolving |
+| `marketOutcome` | QueryAdapter | `market, outcome` | met when the market's `winningOutcome()` equals `outcome` (`YES`/`NO`/`INVALID` or 0/1/2) |
 
 `operator` accepts a name or its numeric code: `lt`=0, `gt`=1, `lte`=2, `gte`=3,
 `eq`=4, `neq`=5.
@@ -238,21 +258,27 @@ await wallet.writeContract({
 
 Processor: `0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE`
 
-| Adapter | Address | Deployed |
-|---------|---------|----------|
-| Wait (conditions) | `0x8448b5f4abD40830C3B980390AbcfD2822719061` | yes |
-| Query | `0x4bC2F784CC76989dA6760Bc6bFCDc3F75c49ee9F` | yes |
-| Aave | `0xC330e841A259E8211D1Ea84c60efD8657DB1D546` | yes |
-| Transfer | `0x6cA85B548d3512E355B63Fb390dBD197CF72d5eA` | yes |
-| Approve | `0x1ff4459D35E956BA999ECf80C20Ad559904398A0` | yes |
-| Swap (Uniswap V3) | `0x9952735758c18d00D3cf2D1D0985A93b265a2126` | yes |
-| Wrap (ETH↔WETH) | `0xD9142Ae0fCf4Fe81b39cD196BC37C9675DC86516` | yes |
-| Balance | `0x78f84ea305d41D97C540B55651A5A0CA01bF61De` | **NOT deployed** |
-| Price | `0xa28C0E516d624D82aBd75D6B84eC08A3be5c31d1` | **NOT deployed** |
+All 11 adapters are deployed on Base Sepolia; each address + `adapterId` was verified
+on-chain (the upstream W3Cash SKILL.md/README address tables are unreliable — they
+contain dead and double-claimed entries):
 
-`balance` / `price` conditions still compile (for completeness) but their ops
-revert on-chain until a real adapter address exists — the response `warnings[]`
-flags this, and `/capabilities` marks them `deployed: false`.
+| Adapter | Address |
+|---------|---------|
+| Transfer | `0x6cA85B548d3512E355B63Fb390dBD197CF72d5eA` |
+| Approve | `0x1ff4459D35E956BA999ECf80C20Ad559904398A0` |
+| Swap (Uniswap V3) | `0x9952735758c18d00D3cf2D1D0985A93b265a2126` |
+| Aave | `0xC330e841A259E8211D1Ea84c60efD8657DB1D546` |
+| Wrap (ETH↔WETH) | `0xD9142Ae0fCf4Fe81b39cD196BC37C9675DC86516` |
+| Bridge (Across) | `0x3502362cAB171ffF2bF094fC70FD5977c9AD7090` |
+| Wait | `0x8448b5f4abD40830C3B980390AbcfD2822719061` |
+| Query (backs `balance`/`price`/`marketResolved`/`marketOutcome`) | `0x4bC2F784CC76989dA6760Bc6bFCDc3F75c49ee9F` |
+| TimeRange | `0xCC18E7E2283D3067B30D0e9a3Ba189FE25dB62EB` |
+| GasPrice | `0x07DcD715DdAB18D449b10BB6140916e8a0F7f657` |
+| Signature | `0xEEe61780cC5fC62B7017E46BB7f6b27fD8BAfBEe` |
+
+`balance`, `price`, `marketResolved`, and `marketOutcome` all compile to the deployed
+**QueryAdapter** (a generic `staticcall` view-gate), so no separate Balance/Price
+adapter is needed.
 
 ## Deploy notes (VPS + HTTPS)
 
