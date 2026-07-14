@@ -9,6 +9,7 @@ import express, {
 import {
   compileIntent,
   getCapabilities,
+  getRecipes,
   ValidationError,
   PROCESSOR,
   CHAIN_ID,
@@ -81,6 +82,11 @@ app.get("/health", (_req: Request, res: Response) => {
 // Capability discovery — supported actions/conditions + adapter catalog.
 app.get("/capabilities", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true, capabilities: getCapabilities() });
+});
+
+// Canned recipes — ready-to-POST request bodies for common automations.
+app.get("/recipes", (_req: Request, res: Response) => {
+  res.status(200).json({ ok: true, recipes: getRecipes() });
 });
 
 /**

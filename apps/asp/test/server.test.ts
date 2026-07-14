@@ -77,11 +77,34 @@ describe("GET /capabilities", () => {
     expect(body.capabilities.chainId).toBe(CHAIN_ID);
     expect(body.capabilities.actions.length).toBeGreaterThan(0);
     expect(body.capabilities.conditions.length).toBeGreaterThan(0);
-    // Balance/Price flagged not-deployed in the catalog surfaced over HTTP.
+    // balance/price re-route onto the deployed QueryAdapter; no standalone
+    // Balance adapter remains in the catalog surfaced over HTTP.
     const balance = body.capabilities.adapterCatalog.find(
       (a) => a.key === "balance"
     );
-    expect(balance?.deployed).toBe(false);
+    expect(balance).toBeUndefined();
+    const query = body.capabilities.adapterCatalog.find((a) => a.key === "query");
+    expect(query?.deployed).toBe(true);
+  });
+});
+
+describe("GET /recipes", () => {
+  it("returns 200 with canned recipes + a first-class replay caveat", async () => {
+    const res = await fetch(base + "/recipes");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      recipes: {
+        chainId: number;
+        replay: { replayable: boolean; cancel: string };
+        recipes: { id: string; request: unknown }[];
+      };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.recipes.chainId).toBe(CHAIN_ID);
+    expect(body.recipes.recipes.length).toBeGreaterThanOrEqual(5);
+    expect(body.recipes.replay.replayable).toBe(true);
+    expect(body.recipes.replay.cancel).toContain("incrementNonce");
   });
 });
 
@@ -172,7 +195,7 @@ describe("POST /compile-intent — validation 400s", () => {
   it("rejects a prototype-pollution operator (SEC-1)", async () => {
     const { status, body } = await postJson("/compile-intent", {
       conditions: [
-        { type: "balance", target: DEAD, operator: "toString", threshold: "1" },
+        { type: "balance", token: USDC, target: DEAD, operator: "toString", threshold: "1" },
       ],
     });
     expect(status).toBe(400);
