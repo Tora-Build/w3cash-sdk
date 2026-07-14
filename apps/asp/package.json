@@ -12,6 +12,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@okxweb3/x402-core": "^0.1.0",
+    "@okxweb3/x402-evm": "^0.2.1",
+    "@okxweb3/x402-express": "^0.1.1",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "viem": "^2.21.0"

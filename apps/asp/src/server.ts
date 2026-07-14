@@ -14,6 +14,7 @@ import {
   CHAIN_ID,
   type CompileRequest,
 } from "./w3cash/encode.js";
+import { buildX402Middleware } from "./x402.js";
 
 const app = express();
 
@@ -64,7 +65,13 @@ const paymentConfig = {
   okxSecretKey: process.env.OKX_SECRET_KEY,
   okxPassphrase: process.env.OKX_PASSPHRASE,
 } as const;
-void paymentConfig; // referenced by the (not-yet-wired) x402 middleware
+
+// x402 pay-per-call gate (phase-2). Returns null in free mode (default), or an
+// Express middleware when X402_ENABLED=true and fully configured. Registered
+// before the routes so it can 402-gate POST /compile-intent; other routes pass
+// through free. Top-level await is fine here (ESM); free mode resolves instantly.
+const x402Middleware = await buildX402Middleware(paymentConfig);
+if (x402Middleware) app.use(x402Middleware);
 
 // Health / self-check endpoint (used by OKX A2MCP endpoint verification).
 app.get("/health", (_req: Request, res: Response) => {
@@ -98,9 +105,8 @@ const compileHandler: RequestHandler = (req: Request, res: Response) => {
   }
 };
 
-// Phase-1: no payment gate. To add x402, unshift the 402-gate middleware here.
-const paidMiddlewares: RequestHandler[] = [];
-app.post("/compile-intent", ...paidMiddlewares, compileHandler);
+// Payment gating (when enabled) is applied globally above via buildX402Middleware.
+app.post("/compile-intent", compileHandler);
 
 // 404 JSON fallback so unknown routes return the {ok:false,...} envelope rather
 // than Express's default HTML page.
