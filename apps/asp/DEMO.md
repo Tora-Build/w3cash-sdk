@@ -46,6 +46,31 @@ Then cut to the Basescan tx to show a real execution of exactly this shape.
 
 ---
 
+## Monetization — x402 (Revenue Rocket)
+
+Free by default, but a **pay-per-call A2MCP** in one flag flip (`X402_ENABLED=true`).
+With payments on, `POST /compile-intent` returns a standard **HTTP 402 +
+`PAYMENT-REQUIRED`** — $0.01 in **USD₮0 on X Layer** — which the caller's Agentic
+Wallet pays automatically, then the request replays. Verified live:
+
+```json
+{
+  "x402Version": 2,
+  "accepts": [{
+    "scheme": "exact",
+    "network": "eip155:1952",                               // X Layer testnet (mainnet: eip155:196)
+    "amount": "10000",                                       // 0.01 USD₮0 (6 decimals)
+    "asset": "0x9e29b3aada05bf2d2c827af80bd28dc0b9b4fb0c",   // USD₮0
+    "payTo": "0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"    // Agentic Wallet
+  }]
+}
+```
+
+Nice symmetry for the pitch: W3Cash **gets paid via x402** *and* **automates x402
+payments** (it ships an `x402Flow` adapter). Built on OKX's `@okxweb3/x402-express` SDK.
+
+---
+
 ## X post (≤ the 90s clip), tag **#OKXAI**
 
 > Meet the W3Cash Intent Compiler — an #OKXAI ASP that turns any agent request into a

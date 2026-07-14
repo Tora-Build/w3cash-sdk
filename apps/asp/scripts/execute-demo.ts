@@ -35,8 +35,9 @@ const TRANSFER_ADAPTER = getAddress("0x6cA85B548d3512E355B63Fb390dBD197CF72d5eA"
 const RECIPIENT = getAddress("0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"); // Agentic Wallet
 const AMOUNT = 1_000_000n; // 1 USDC (6 decimals)
 
-const pk = process.env.RELAYER_PRIVATE_KEY as Hex | undefined;
-if (!pk) throw new Error("RELAYER_PRIVATE_KEY not set in .env");
+const rawPk = process.env.RELAYER_PRIVATE_KEY;
+if (!rawPk) throw new Error("RELAYER_PRIVATE_KEY not set in .env");
+const pk = (rawPk.startsWith("0x") ? rawPk : `0x${rawPk}`) as Hex;
 
 const account = privateKeyToAccount(pk);
 const publicClient = createPublicClient({ chain: baseSepolia, transport: http(RPC) });
