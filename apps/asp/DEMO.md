@@ -19,19 +19,7 @@ executes the moment the condition hits.
 
 ---
 
-## 90-second storyboard
-
-| Time | Scene | Show |
-|---|---|---|
-| 0:00–0:12 | **Hook** | "Agents can already swap, lend, and bridge — *right now*. What they can't do is 'do it **only when**…'. W3Cash is the conditions layer: sign once, a keeper fires it when your rule hits." |
-| 0:12–0:35 | **Discover** | `curl .../capabilities` — **12 condition types** (time, block, price, balance, gas, **co-signer**, **prediction-market**) gating **8 actions** (swap/transfer/aave/wrap/**bridge**). "The gates are the product; the actions are the payload." |
-| 0:35–1:05 | **Compile (the hero)** | `curl .../compile-intent` → **"withdraw only if my Sooth prediction market resolves YES"** → the encoded intent + the exact `toSign`. Non-custodial; the agent's OKX Agentic Wallet signs. No other team can gate on a truth layer they own. |
-| 1:05–1:25 | **Execute (real)** | Open the Basescan tx — a signed, `execute()`'d intent that **moved 1 USDC on-chain**, condition gate and all. |
-| 1:25–1:30 | **Close** | "The conditional layer on top of every protocol — even a cross-chain Across bridge. Listed on OKX.AI, paid per call via x402." |
-
----
-
-## On-camera commands (copy/paste, all hit the LIVE endpoint)
+## Commands to record (no narration — the output is the story)
 
 ```bash
 URL=https://146-103-42-69.sslip.io
