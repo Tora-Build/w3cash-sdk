@@ -1,9 +1,16 @@
 # W3Cash Intent Compiler (ASP)
 
-A non-custodial **A2MCP** endpoint for OKX.AI OnchainOS. It compiles a structured
-request into a **signable W3Cash intent** for the `W3CashProcessor` on **Base
-Sepolia (chainId 84532)**. It returns the exact 32-byte message the initiator must
-sign — **it never signs, never holds keys, and never broadcasts.**
+The **conditional-execution layer** for AI agents — a non-custodial **A2MCP** endpoint
+for OKX.AI OnchainOS. It turns *"do X **only when** Y"* into a **signable W3Cash intent**
+for the `W3CashProcessor` on **Base Sepolia (chainId 84532)**: the agent signs once, and a
+keeper executes when the condition is met. It returns the exact 32-byte message to sign —
+**it never signs, never holds keys, and never broadcasts.**
+
+The value is the **gating**, not the actions. Swaps / bridges / lending are commodity legs
+(specialists like Across, Uniswap, and Aave execute each best, *now*); we're the layer that
+makes any of them fire **only when** a condition — time, price, gas, balance, a co-signer,
+or **a prediction market resolving** — is met. The one gate no one else has is a market's
+outcome, because we own both the compiler and the truth layer (Sooth).
 
 - **Free by default; x402-ready.** The endpoint is free and unauthenticated out of the
   box. A pay-per-call **x402** tier (0.01 USD₮0 on X Layer) is fully wired and one flag

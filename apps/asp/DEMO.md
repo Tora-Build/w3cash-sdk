@@ -1,8 +1,16 @@
 # W3Cash Intent Compiler — 90-second demo kit
 
-**One-liner:** an OKX.AI **A2MCP ASP** that turns any agent's plain request into a
-**ready-to-sign, conditional on-chain automation** — non-custodial. The agent's
-Agentic Wallet signs and executes. "Every on-chain action, as an agent skill."
+**One-liner:** the **conditional-execution layer** for AI agents — an OKX.AI **A2MCP
+ASP** that turns *"do X **only when** Y"* into a **ready-to-sign, self-executing
+on-chain automation**, non-custodial. `Y` can be time, price, gas, a co-signer — or,
+uniquely, **a prediction market resolving**. The agent's Agentic Wallet signs; a keeper
+executes the moment the condition hits.
+
+> **What it is / isn't.** Not another bridge, DEX, or lending app — those exist, and
+> specialists (Across, Uniswap, Aave) execute them best, *right now*. We're the layer
+> that makes any of them fire **only when your rule is met**, signed once. The gates are
+> the product; the actions are commodity legs we compose. The one gate nobody else has:
+> a market's outcome — because we own both the intent compiler **and** the truth layer.
 
 - **Live endpoint:** `https://146-103-42-69.sslip.io`
 - **Proven on-chain (Base Sepolia):**
@@ -15,11 +23,11 @@ Agentic Wallet signs and executes. "Every on-chain action, as an agent skill."
 
 | Time | Scene | Show |
 |---|---|---|
-| 0:00–0:12 | **Hook** | "AI agents can chat, but they can't *do* complex on-chain automations. W3Cash makes 'every on-chain action' a skill any agent can call." |
-| 0:12–0:35 | **Discover** | `curl .../capabilities` — 8 action types + 12 condition types over 11 on-chain-verified adapters. "One API: transfer/approve/swap/aave/wrap/bridge, gated by time/block/price/balance/gas/co-signer/prediction-market." |
-| 0:35–1:05 | **Compile** | `curl .../compile-intent` with "swap-when-price / wait-then-transfer" → returns the encoded intent + the exact `toSign`. "Non-custodial — we never hold keys; the agent's OKX Agentic Wallet signs this." |
-| 1:05–1:25 | **Execute (real)** | Open the Basescan tx — the *same* kind of intent, signed + `execute()`'d, **1 USDC moved on-chain**, condition gate and all. |
-| 1:25–1:30 | **Close** | "Listed on OKX.AI, paid per call via x402. An agent skill that actually moves money." |
+| 0:00–0:12 | **Hook** | "Agents can already swap, lend, and bridge — *right now*. What they can't do is 'do it **only when**…'. W3Cash is the conditions layer: sign once, a keeper fires it when your rule hits." |
+| 0:12–0:35 | **Discover** | `curl .../capabilities` — **12 condition types** (time, block, price, balance, gas, **co-signer**, **prediction-market**) gating **8 actions** (swap/transfer/aave/wrap/**bridge**). "The gates are the product; the actions are the payload." |
+| 0:35–1:05 | **Compile (the hero)** | `curl .../compile-intent` → **"withdraw only if my Sooth prediction market resolves YES"** → the encoded intent + the exact `toSign`. Non-custodial; the agent's OKX Agentic Wallet signs. No other team can gate on a truth layer they own. |
+| 1:05–1:25 | **Execute (real)** | Open the Basescan tx — a signed, `execute()`'d intent that **moved 1 USDC on-chain**, condition gate and all. |
+| 1:25–1:30 | **Close** | "The conditional layer on top of every protocol — even a cross-chain Across bridge. Listed on OKX.AI, paid per call via x402." |
 
 ---
 
@@ -84,17 +92,34 @@ agent payment economy. Built on OKX's `@okxweb3/x402-express` SDK.
 
 ## X post (≤ the 90s clip), tag **#OKXAI**
 
-> Meet the W3Cash Intent Compiler — an #OKXAI ASP that turns any agent request into a
-> ready-to-sign, *conditional* on-chain automation. Non-custodial: the agent's Agentic
-> Wallet signs & executes. Live, and already moving real USDC on-chain. 🧵👇
+> Meet the W3Cash Intent Compiler — the #OKXAI **conditional-execution layer** for agents.
+> Not another bridge/DEX — the thing that makes ANY of them fire *only when your rule hits*,
+> signed once, non-custodial. Live, moving real USDC on Base Sepolia. 🧵👇
 >
-> • 8 action types + 12 condition types over 11 on-chain-verified adapters
-> • Gates: time/block, price, balance, gas, co-signer, prediction-market — plus cross-chain bridge (Across)
-> • A2MCP, pay-per-call via x402
-> • Proven end-to-end on Base Sepolia
+> • *"Do X only when Y"* — Y = time / price / gas / balance / co-signer / **a prediction market**
+> • The flagship nobody else has: gate an intent on a Sooth market resolving YES
+> • 12 condition types × 8 actions (incl. a *gated* Across bridge), A2MCP, pay-per-call via x402
 > [demo video] [basescan tx] [endpoint]
 
 ---
+
+## OKX.AI listing blurb (for the marketplace / Google form)
+
+> **W3Cash Intent Compiler** — the conditional-execution layer for agents. Give it a goal
+> as `{conditions, actions}` and it returns a ready-to-sign, self-executing on-chain intent:
+> *"do X only when Y."* `Y` can be time, price, gas, balance, a co-signer — or, uniquely, a
+> **Sooth prediction market resolving**. Non-custodial (never touches keys), pay-per-call via
+> **x402** (0.01 USD₮0 on X Layer). It doesn't reimplement swaps or bridges — it **composes**
+> best-in-class legs (Uniswap, Aave, **Across**) and makes them *conditional*. Live on Base
+> Sepolia; 8 actions × 12 conditions over 11 on-chain-verified adapters.
+
+## Where Across fits (and why we don't compete with it)
+
+Across already serves agents directly (its `skills` + Swap API bridge across 24+ chains).
+We don't try to be a better bridge — we **wrap** it: the `bridge` action is an Across
+`depositV3` leg, auto-quoted live via Across's suggested-fees API, that fires **only when
+your condition is met**. An agent uses Across to bridge *now*; it uses **us** to bridge
+*when gas is cheap* or *after a market resolves*. **Across = execution; W3Cash = conditions.**
 
 ## Notes
 - Endpoint is the interim `sslip.io` HTTPS host; swaps to `asp.w3.cash` once DNS is set (one endpoint update on OKX).
