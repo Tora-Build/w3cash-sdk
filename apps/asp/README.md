@@ -91,6 +91,18 @@ caveat as a first-class field.
 curl localhost:4000/recipes
 ```
 
+### `POST /quote/bridge`
+
+Returns a **live Across quote** (`outputAmount`, `quoteTimestamp`, `fillDeadline`,
+deposit limits) for a cross-chain transfer, so a `bridge` action can be filled
+without computing fees. Body: `{ inputToken, destinationChainId, inputAmount, outputToken?, recipient? }`.
+(The same fetch runs inline when a `bridge` action sets `autoQuote: true`.)
+
+```bash
+curl -X POST localhost:4000/quote/bridge -H 'Content-Type: application/json' \
+  -d '{"inputToken":"0x036CbD53842c5426634e7929541eC2318f3dCF7e","destinationChainId":11155111,"inputAmount":"5000000"}'
+```
+
 ### `POST /compile-intent`
 
 Compiles the intent. Body:
@@ -194,7 +206,7 @@ means the initiator must `approve(adapter, …)` the relevant token **to the ada
 | `aaveWithdraw` | AaveAdapter | `token, amount, value?` | yes — of the aToken (selector `0xf3fef3a3`) |
 | `aaveWithdrawAll` | AaveAdapter | `token, value?` | yes — of the aToken (selector `0xfa09e630`) |
 | `wrap` | WrapAdapter | `isWrap, amount, value?` | `isWrap=false` (WETH→ETH) needs prior WETH approve; `isWrap=true` forwards ETH via `value` (defaults to `amount`) |
-| `bridge` | BridgeAdapter | `recipient, destinationChainId, inputToken, outputToken?, inputAmount, outputAmount, quoteTimestamp, fillDeadline, exclusivityDeadline?, message?, value?` | yes — of `inputToken`. Across `depositV3`, ERC20-only. `outputAmount`/`quoteTimestamp` are **caller-supplied** — fetch an Across suggested-fees quote; stale values won't fill on-chain |
+| `bridge` | BridgeAdapter | `recipient, destinationChainId, inputToken, inputAmount` + either `outputAmount, quoteTimestamp, fillDeadline` **or `autoQuote: true`** | yes — of `inputToken`. Across `depositV3`, ERC20-only. Set **`autoQuote: true`** and the ASP fetches the live Across quote (outputAmount/quoteTimestamp/fillDeadline) for you; or supply them yourself (standalone quote at `POST /quote/bridge`) |
 
 ## Supported conditions
 

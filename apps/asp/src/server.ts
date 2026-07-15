@@ -16,6 +16,7 @@ import {
   type CompileRequest,
 } from "./w3cash/encode.js";
 import { buildX402Middleware } from "./x402.js";
+import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
 
 const app = express();
 
@@ -89,6 +90,43 @@ app.get("/recipes", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true, recipes: getRecipes() });
 });
 
+// Live Across bridge quote — returns outputAmount/quoteTimestamp/fillDeadline for a
+// cross-chain transfer, so a `bridge` action can be filled without the caller
+// computing Across fees. (Also available inline via a bridge action's autoQuote:true.)
+app.post("/quote/bridge", async (req: Request, res: Response) => {
+  try {
+    const b = req.body as {
+      inputToken?: string;
+      outputToken?: string;
+      destinationChainId?: number | string;
+      inputAmount?: string;
+      recipient?: string;
+    };
+    if (!b.inputToken || b.destinationChainId === undefined || !b.inputAmount) {
+      res.status(400).json({
+        ok: false,
+        error: "inputToken, destinationChainId and inputAmount are required",
+        code: "VALIDATION",
+      });
+      return;
+    }
+    const quote = await fetchAcrossQuote({
+      inputToken: b.inputToken,
+      outputToken: b.outputToken,
+      destinationChainId: Number(b.destinationChainId),
+      amount: b.inputAmount,
+      recipient: b.recipient,
+    });
+    res.status(200).json({ ok: true, quote });
+  } catch (err) {
+    if (err instanceof AcrossQuoteError) {
+      res.status(502).json({ ok: false, error: err.message, code: "BRIDGE_QUOTE" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
+});
+
 /**
  * A2MCP tool endpoint. Non-custodial: compiles a signable W3Cash intent from a
  * structured body {chain?, nonce?, seq?, initiator?, conditions[], actions[]}.
@@ -96,12 +134,59 @@ app.get("/recipes", (_req: Request, res: Response) => {
  * hash, and the raw 32-byte message the initiator must EIP-191 personal-sign.
  * This ASP NEVER signs or holds keys.
  */
-const compileHandler: RequestHandler = (req: Request, res: Response) => {
+/**
+ * Bridge auto-quote: when a `bridge` action sets `autoQuote: true`, fetch a live
+ * Across quote server-side and fill outputAmount/quoteTimestamp/fillDeadline/
+ * exclusivityDeadline so the caller doesn't have to. No-op for every other action.
+ */
+interface BridgeActionLike {
+  type?: string;
+  autoQuote?: boolean;
+  inputToken?: string;
+  outputToken?: string;
+  destinationChainId?: number | string;
+  inputAmount?: string;
+  recipient?: string;
+  outputAmount?: string;
+  quoteTimestamp?: number;
+  fillDeadline?: number;
+  exclusivityDeadline?: number;
+}
+async function applyBridgeAutoQuote(body: CompileRequest): Promise<void> {
+  const actions = (body.actions ?? []) as BridgeActionLike[];
+  for (const a of actions) {
+    if (a.type !== "bridge" || a.autoQuote !== true) continue;
+    if (!a.inputToken || a.destinationChainId === undefined || !a.inputAmount) {
+      throw new ValidationError(
+        "bridge autoQuote requires inputToken, destinationChainId and inputAmount"
+      );
+    }
+    const quote = await fetchAcrossQuote({
+      inputToken: a.inputToken,
+      outputToken: a.outputToken,
+      destinationChainId: Number(a.destinationChainId),
+      amount: a.inputAmount,
+      recipient: a.recipient,
+    });
+    a.outputAmount = quote.outputAmount;
+    a.quoteTimestamp = quote.quoteTimestamp;
+    a.fillDeadline = quote.fillDeadline;
+    a.exclusivityDeadline = quote.exclusivityDeadline;
+    delete a.autoQuote;
+  }
+}
+
+const compileHandler: RequestHandler = async (req: Request, res: Response) => {
   try {
     const body = req.body as CompileRequest;
+    await applyBridgeAutoQuote(body);
     const intent = compileIntent(body);
     res.status(200).json({ ok: true, intent });
   } catch (err) {
+    if (err instanceof AcrossQuoteError) {
+      res.status(502).json({ ok: false, error: err.message, code: "BRIDGE_QUOTE" });
+      return;
+    }
     if (err instanceof ValidationError) {
       res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
       return;
