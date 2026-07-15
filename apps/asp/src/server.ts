@@ -13,6 +13,7 @@ import {
   ValidationError,
   PROCESSOR,
   CHAIN_ID,
+  MAX_STEPS,
   type CompileRequest,
 } from "./w3cash/encode.js";
 import { buildX402Middleware } from "./x402.js";
@@ -101,8 +102,17 @@ app.post("/quote/bridge", async (req: Request, res: Response) => {
       destinationChainId?: number | string;
       inputAmount?: string;
       recipient?: string;
-    };
-    if (!b.inputToken || b.destinationChainId === undefined || !b.inputAmount) {
+    } | null;
+    // Guard shape before dereferencing so a null/non-object body returns the
+    // documented 400 VALIDATION envelope rather than throwing a TypeError that
+    // the catch below would map to 500.
+    if (
+      !b ||
+      typeof b !== "object" ||
+      !b.inputToken ||
+      b.destinationChainId === undefined ||
+      !b.inputAmount
+    ) {
       res.status(400).json({
         ok: false,
         error: "inputToken, destinationChainId and inputAmount are required",
@@ -128,12 +138,12 @@ app.post("/quote/bridge", async (req: Request, res: Response) => {
 });
 
 /**
- * A2MCP tool endpoint. Non-custodial: compiles a signable W3Cash intent from a
- * structured body {chain?, nonce?, seq?, initiator?, conditions[], actions[]}.
- * Returns the operation/input arrays, the assembled instruction, the payload
- * hash, and the raw 32-byte message the initiator must EIP-191 personal-sign.
- * This ASP NEVER signs or holds keys.
+ * Cap on bridge actions that may set autoQuote:true in a single request. Each one
+ * fires an outbound Across fetch, so this bounds the per-request outbound fan-out.
+ * The encoder's MAX_STEPS guard runs AFTER auto-quoting and would not cover it.
  */
+const MAX_AUTOQUOTE = 4;
+
 /**
  * Bridge auto-quote: when a `bridge` action sets `autoQuote: true`, fetch a live
  * Across quote server-side and fill outputAmount/quoteTimestamp/fillDeadline/
@@ -153,9 +163,25 @@ interface BridgeActionLike {
   exclusivityDeadline?: number;
 }
 async function applyBridgeAutoQuote(body: CompileRequest): Promise<void> {
-  const actions = (body.actions ?? []) as BridgeActionLike[];
-  for (const a of actions) {
-    if (a.type !== "bridge" || a.autoQuote !== true) continue;
+  // Leave the 400 to compileIntent for a non-object body or a non-array `actions`.
+  // Dereferencing them here would throw a raw TypeError the handler maps to 500,
+  // breaking the documented {code:"VALIDATION"} 400 contract.
+  if (!body || typeof body !== "object" || !Array.isArray(body.actions)) return;
+  const actions = body.actions as BridgeActionLike[];
+  // Bound the outbound fan-out BEFORE any fetch. Without this, one small body
+  // could trigger hundreds of sequential Across calls (request-duration DoS +
+  // Across-side rate-limit/ban). Oversized step counts are rejected by
+  // compileIntent's MAX_STEPS guard, so just bail here and let it produce the 400.
+  if (actions.length > MAX_STEPS) return;
+  const autoQuoteActions = actions.filter(
+    (a) => a?.type === "bridge" && a.autoQuote === true
+  );
+  if (autoQuoteActions.length > MAX_AUTOQUOTE) {
+    throw new ValidationError(
+      `at most ${MAX_AUTOQUOTE} bridge actions may set autoQuote:true (got ${autoQuoteActions.length})`
+    );
+  }
+  for (const a of autoQuoteActions) {
     if (!a.inputToken || a.destinationChainId === undefined || !a.inputAmount) {
       throw new ValidationError(
         "bridge autoQuote requires inputToken, destinationChainId and inputAmount"
@@ -176,6 +202,13 @@ async function applyBridgeAutoQuote(body: CompileRequest): Promise<void> {
   }
 }
 
+/**
+ * A2MCP tool endpoint. Non-custodial: compiles a signable W3Cash intent from a
+ * structured body {chain?, nonce?, seq?, initiator?, conditions[], actions[]}.
+ * Returns the operation/input arrays, the assembled instruction, the payload
+ * hash, and the raw 32-byte message the initiator must EIP-191 personal-sign.
+ * This ASP NEVER signs or holds keys.
+ */
 const compileHandler: RequestHandler = async (req: Request, res: Response) => {
   try {
     const body = req.body as CompileRequest;

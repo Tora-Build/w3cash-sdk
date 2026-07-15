@@ -266,8 +266,9 @@ export type ActionRequest =
       // Cross-chain bridge via Across depositV3 (BridgeAdapter). Native ETH is
       // NOT supported — inputToken must be an ERC20 (bridge WETH). Initiator must
       // approve BridgeAdapter for inputAmount of inputToken before signing.
-      // outputAmount + quoteTimestamp should come from the Across suggested-fees
-      // quote (auto-quoting is a TODO — supply them yourself).
+      // outputAmount/quoteTimestamp/fillDeadline can be auto-filled by the server
+      // (set autoQuote:true on the bridge action, or POST /quote/bridge); supply
+      // them yourself only when quoting manually.
       type: "bridge";
       recipient: string; // recipient on the destination chain
       destinationChainId: Numeric; // REAL EVM chain id (e.g. 11155111 Sepolia)
@@ -447,7 +448,6 @@ const UINT_MAX = {
 export const MAX_STEPS = 32 as const;
 
 function toBigInt(value: Numeric, field: string): bigint {
-  if (typeof value === "bigint") return value;
   if (typeof value === "number") {
     if (!Number.isInteger(value)) {
       throw new ValidationError(`${field} must be an integer, got ${value}`);
@@ -510,9 +510,8 @@ function hexBytes(value: unknown, field: string): Hex {
   if (typeof value !== "string" || !isHex(value)) {
     throw new ValidationError(`${field} must be a 0x-hex string`);
   }
-  // `value` is a "0x"-prefixed hex string here, so (length - 2) is the number of
-  // hex digits. Reject odd counts, which do not form whole bytes. (viem's size()
-  // never returns undefined, so the previous size()-based guard was dead.)
+  // `value` is a "0x"-prefixed hex string here, so (length - 2) is the hex-digit
+  // count. Reject odd counts, which do not form whole bytes.
   if ((value.length - 2) % 2 !== 0) {
     throw new ValidationError(`${field} must have an even number of hex digits`);
   }
@@ -936,7 +935,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
           outputToken === ZERO_ADDRESS ? "auto/wrapped-native" : outputToken
         } to ${recipient} via Across depositV3 (initiator must approve BridgeAdapter for inputToken first)`,
         warnings: [
-          "bridge.outputAmount and bridge.quoteTimestamp are caller-supplied and SHOULD come from the Across suggested-fees quote (GET https://testnet.across.to/api/suggested-fees?...&originChainId=84532&destinationChainId=<dst>&amount=<in>): outputAmount = inputAmount - totalRelayFee.total, quoteTimestamp = json.timestamp. quoteTimestamp must be within 3600s of chain time or depositV3 reverts; too-high outputAmount never fills. Auto-quoting is a TODO — the ASP does not fetch it in-process.",
+          "bridge.outputAmount and bridge.quoteTimestamp are caller-supplied and SHOULD come from the Across suggested-fees quote (GET https://testnet.across.to/api/suggested-fees?...&originChainId=84532&destinationChainId=<dst>&amount=<in>): outputAmount = inputAmount - totalRelayFee.total, quoteTimestamp = json.timestamp. quoteTimestamp must be within 3600s of chain time or depositV3 reverts; too-high outputAmount never fills. The encoder does not fetch these — set autoQuote:true on the bridge action (or POST /quote/bridge) to have the ASP fill them for you.",
         ],
       };
     }
@@ -1173,10 +1172,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       const calldata = hexBytes(cond.calldata, "query.calldata");
       const operator = resolveOperator(cond.operator, "query.operator");
       const expected = toUint(cond.expected, "query.expected", UINT_MAX.u256);
-      const input = encodeAbiParameters(
-        parseAbiParameters("address, bytes, uint8, uint256"),
-        [target, calldata, operator, expected]
-      );
+      const input = queryInput(target, calldata, operator, expected);
       return {
         input,
         adapter: ADAPTERS.query,
@@ -1260,11 +1256,6 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     const operation = encodeOperation(encoded.adapter.address, encoded.value);
     operations.push(operation);
     inputs.push(encoded.input);
-    if (!encoded.adapter.deployed) {
-      warnings.push(
-        `${type}: ${encoded.adapter.name} at ${encoded.adapter.address} is NOT deployed on Base Sepolia — this operation will revert on-chain until a real adapter address is available.`
-      );
-    }
     if (encoded.warnings) {
       for (const w of encoded.warnings) warnings.push(`#${index} [${type}] ${w}`);
     }

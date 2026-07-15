@@ -9,7 +9,9 @@
     "start": "node dist/server.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "proof": "tsx scripts/decode-proof.ts",
+    "demo": "tsx scripts/execute-demo.ts"
   },
   "dependencies": {
     "@okxweb3/x402-core": "^0.1.0",

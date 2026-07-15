@@ -188,7 +188,7 @@ Field meanings:
 | `toSign` | **The raw 32-byte message to sign** = `keccak256(abi.encodePacked(payloadHash, nonce))`. Depends on the nonce. |
 | `signing` | `{ scheme, messageHash, nonce, replayable, signedPayloadFormat, note }`. |
 | `steps[]` | Human-readable per-step `{ index, kind, type, adapter, target, value, operation, input, summary }`. |
-| `warnings[]` | Includes the **replay caveat** (always), not-deployed-adapter flags, native-value totals, and seq-skip notes. |
+| `warnings[]` | Includes the **replay caveat** (always), native-value totals, seq-skip notes, and per-step advisories (e.g. dropped `price` staleness, bridge-quote guidance). |
 
 Example validation error:
 
@@ -213,7 +213,7 @@ means the initiator must `approve(adapter, …)` the relevant token **to the ada
 | `aaveWithdraw` | AaveAdapter | `token, amount, value?` | yes — of the aToken (selector `0xf3fef3a3`) |
 | `aaveWithdrawAll` | AaveAdapter | `token, value?` | yes — of the aToken (selector `0xfa09e630`) |
 | `wrap` | WrapAdapter | `isWrap, amount, value?` | `isWrap=false` (WETH→ETH) needs prior WETH approve; `isWrap=true` forwards ETH via `value` (defaults to `amount`) |
-| `bridge` | BridgeAdapter | `recipient, destinationChainId, inputToken, inputAmount` + either `outputAmount, quoteTimestamp, fillDeadline` **or `autoQuote: true`** | yes — of `inputToken`. Across `depositV3`, ERC20-only. Set **`autoQuote: true`** and the ASP fetches the live Across quote (outputAmount/quoteTimestamp/fillDeadline) for you; or supply them yourself (standalone quote at `POST /quote/bridge`) |
+| `bridge` | BridgeAdapter | `recipient, destinationChainId, inputToken, inputAmount, outputToken?, exclusivityDeadline?, message?, value?` + either `outputAmount, quoteTimestamp, fillDeadline` **or `autoQuote: true`** | yes — of `inputToken`. Across `depositV3`, ERC20-only. Set **`autoQuote: true`** and the ASP fetches the live Across quote (outputAmount/quoteTimestamp/fillDeadline) for you; or supply them yourself (standalone quote at `POST /quote/bridge`). `message?` is the Across destination-execution hook — calldata run on the destination chain when a relayer fills (the basis for embedded cross-chain, see Roadmap) |
 
 ## Supported conditions
 
@@ -349,11 +349,69 @@ worst-case CPU per request but are not a substitute for gateway rate limiting.
 
 ## Live smoke test
 
-`scripts/verify-transfer.mjs` `eth_call`s the deployed Processor with a compiled
-conditional-transfer intent to prove the envelope decodes, the signature verifies,
-and routing reaches both adapters. It is a network-dependent smoke test — the
-deterministic regression guard is `pnpm test`.
+`scripts/decode-proof.ts` `eth_call`s the deployed Processor with a compiled
+**prediction-market-gated** intent (a Sooth `TruthMarket` gate via QueryAdapter, then
+a USDC transfer) to prove the envelope decodes and each op routes to the right adapter
+— funds-free, no state change. It runs two cases (gate-not-met → clean pause; gate-met
+→ adapter-level allowance revert) and exits non-zero on any decode/route fault. It pins
+the consistent `https://base-sepolia-rpc.publicnode.com` RPC (override with
+`BASE_SEPOLIA_RPC`). It is a network-dependent smoke test — the deterministic
+regression guard is `pnpm test`.
 
 ```bash
-npx tsx scripts/verify-transfer.mjs
+npx tsx scripts/decode-proof.ts   # or: pnpm proof
 ```
+
+To prove a **real** on-chain execution (moves 1 USDC; needs `RELAYER_PRIVATE_KEY` in
+`.env`), run `pnpm demo` (`scripts/execute-demo.ts`).
+
+## Roadmap
+
+Shipped today: **8 actions × 12 conditions over 11 on-chain-verified adapters** on
+Base Sepolia — free by default, x402-ready. What's next deepens *conditional*
+execution (the layer we own) rather than re-adding commodity legs.
+
+### 1. Conditional embedded cross-chain — Across + MulticallHandler *(flagship)*
+
+Gate a bridge **and** a destination-side DeFi action in a single signed intent:
+*"bridge USDC to Ethereum **and** deposit it into Aave there — only when [condition]."*
+The on-chain hook is already live: Across `depositV3` carries a `message` field, and the
+`bridge` action already exposes it (`message?` in `src/w3cash/encode.ts`, encoded into
+the depositV3 tuple). Across's canonical **MulticallHandler** executes that message on
+the destination chain the moment a relayer fills. What's missing is purely off-chain:
+(a) an **encoding helper** that builds the MulticallHandler payload —
+`abi.encode((Call{ address target, bytes callData, uint256 value }[] calls, address
+fallbackRecipient))` — and points `recipient` at the MulticallHandler; and (b) a
+**recipe** wiring it end-to-end (approve → gated `depositV3` → destination Aave supply).
+Result: one signature, one condition, a cross-chain deposit — no destination keys, no
+second transaction, and **no new W3Cash contracts**.
+
+### 2. More deployed adapters — leverage / perps / yield
+
+Broaden the *action* menu with specialist legs (perps, leveraged positions, and yield
+via GMX / Hyperliquid / Pendle / Morpho) as each is deployed and registry-verified on
+Base Sepolia. Every adapter is just an `encode.ts` entry + a `/capabilities` row + a
+recipe once its address is resolved via `adapterId()` — the compiler/envelope shape
+never changes; only the catalog grows.
+
+### 3. Off-chain-data conditions via a relayer
+
+Extend gating beyond on-chain views to conditions a keeper attests: *"execute when
+smart-money net-buys"* or *"…when a KPI crosses a threshold."* QueryAdapter already
+staticcalls any on-chain `uint256`; a thin relayer (reusing the zkTLS / `kpi-resolver`
+attestation primitive) writes an off-chain value on-chain so the existing `query` /
+`price` gates apply unchanged to real-world data.
+
+### 4. x402 pricing ladder via MPP
+
+Today's paid tier is a single `exact` $0.01 charge. Add tiers to the x402 `accepts[]`
+array — MPP session channels, subscriptions, and a2a-pay links — so a caller picks a
+trust/price model (per-call, metered session, or prepaid). Purely additive; the
+free-by-default posture is unchanged.
+
+### 5. `asp.w3.cash` + mainnet
+
+Cut the interim `sslip.io` host over to `asp.w3.cash` (one endpoint update on OKX.AI),
+and promote the execution target from Base Sepolia to a mainnet deployment once the
+adapter set is audited. Payment settlement follows: X Layer testnet → mainnet
+(`eip155:1952` → `eip155:196`).

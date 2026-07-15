@@ -202,6 +202,25 @@ describe("POST /compile-intent — validation 400s", () => {
     expect(body.code).toBe("VALIDATION");
   });
 
+  it("non-array `actions` returns 400 VALIDATION (not a 500 from the autoQuote pass)", async () => {
+    // The bridge auto-quote pass runs before compileIntent; it must not throw a
+    // raw TypeError on a wrong-shaped `actions`, which the catch would map to 500.
+    const { status, body } = await postJson("/compile-intent", { actions: 123 });
+    expect(status).toBe(400);
+    expect(body.code).toBe("VALIDATION");
+  });
+
+  it("caps the bridge autoQuote fan-out (throws before any outbound fetch)", async () => {
+    // More than MAX_AUTOQUOTE bridge actions with autoQuote:true must be rejected
+    // up front — no Across calls are made — so this stays deterministic offline.
+    const bridge = { type: "bridge", autoQuote: true } as const;
+    const { status, body } = await postJson("/compile-intent", {
+      actions: [bridge, bridge, bridge, bridge, bridge],
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe("VALIDATION");
+  });
+
   it("returns BAD_JSON on malformed JSON (terminal error middleware)", async () => {
     const res = await fetch(base + "/compile-intent", {
       method: "POST",
