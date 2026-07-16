@@ -82,16 +82,23 @@ before compiling. Never guess amounts or addresses.
 
 Keep questions brief. Once you have what you need, proceed without extra chatter.
 
-## Workflow
+## Workflow (fast by default — aim for the fewest steps)
 
-1. **`w3cash_capabilities`** for the target chain — read the exact field names,
-   operator enums, adapter addresses, and the replay caveat. Never guess fields.
-2. **Build `conditions[]` and `actions[]`** as `{ "type": "...", ...fields }`,
-   converting all human amounts/prices to base units per the table above.
-3. **`w3cash_compile_intent`** with `{ chain, initiator, nonce, conditions, actions }`.
-   Read the initiator's current processor nonce first if it may not be 0:
-   `cast call <processor> "nonces(address)(uint256)" <initiator> --rpc-url <rpc>`.
-4. **Read the result** — show `humanSummary` + `warnings`, then sign + execute.
+For a clear, complete execution request (amount, recipient, chain, condition all
+given) do EXACTLY this — no extra tool calls:
+
+1. **Compile.** Call **`w3cash_compile_intent`** with `{ chain, initiator, conditions, actions }`,
+   converting human amounts to base units per the table above. **OMIT `nonce`** — it
+   defaults to 0, which is correct unless the initiator has called `incrementNonce()`.
+   Take `nonce`, `toSign`, and `instruction` straight from the result.
+2. **Execute** via the Fast path below (one call). Done.
+
+Skip these unless actually needed:
+- **`w3cash_capabilities`** — only call it if you're unsure of a field name; the
+  catalog above already lists every type + field. Don't call it for a routine intent.
+- **Reading the nonce with `cast`** — don't; use the compiled `nonce` (0 by default).
+  Only read it (and recompile) if an execute reverts `InvalidNonce`.
+- **A separate balance re-check** — don't; the execute receipt + explorer link is the proof.
 
 ## Action & condition catalog
 
@@ -107,43 +114,39 @@ aaveDeposit, aaveWithdraw*, bridge). `w3cash_capabilities` marks
 `requiresPriorApprove` per action — surface it and, if missing, do the approve
 first (approve exactly the amount the action needs — see Security).
 
-## Sign → execute
+## Sign → execute (two commands — this IS the fast path)
 
 `w3cash_compile_intent` returns `toSign` (the **32-byte EIP-191 personal-sign
-message** the `initiator` signs) and `instruction` (the assembled bytes).
+message** the `initiator` signs) and `instruction` (the assembled bytes). Just two
+standard commands — no bespoke scripts:
 
-> **Fast path (do this — keeps it to TWO actions).** After compiling, run the
-> `execute.sh` helper that ships **in this skill's directory** — it does the
-> keyless OnchainOS sign + assembles the payload + relays `execute()` in one call:
-> `bash <this-skill-dir>/execute.sh <chain> <initiator> <nonce> <toSign> <instruction>`
-> So the whole flow is: **(1) `w3cash_compile_intent`** (MCP) → **(2) `execute.sh`**.
-> Do NOT add a separate balance-read step or re-verify — the printed tx hash +
-> the explorer link (`https://www.oklink.com/xlayer-test/tx/<hash>` for 1952) is
-> the confirmation. The manual sub-steps below are the fallback if the helper
-> isn't present.
+**1. Sign** `toSign` as **raw bytes** (EIP-191 personal sign):
 
-**Sign** — two ways:
-
-- *Any EOA / wallet:* personal-sign `toSign` as **raw bytes**
-  (viem: `signMessage({ message: { raw: toSign } })`).
 - *OnchainOS Agentic Wallet (keyless — no private key):*
-  1. address: `onchainos wallet addresses`
-  2. sign: `onchainos wallet sign-message --message <toSign> --chain <id> --from <address> --type personal --force` → `data.signature`.
-  This signs the **raw 32 bytes** under the EIP-191 prefix, exactly what the
-  processor verifies (confirmed on X Layer 1952). No key is ever exported.
+  `onchainos wallet sign-message --message <toSign> --chain <chainId> --from <initiator> --type personal --force`
+  → take `data.signature`. This signs the raw 32 bytes under the EIP-191 prefix,
+  exactly what the processor verifies (confirmed on X Layer 1952). No key exported.
+- *Any other wallet:* personal-sign `toSign` as raw bytes with your own signer
+  (viem: `signMessage({ message: { raw: toSign } })`).
 
-**Execute** — assemble the signed payload and submit:
+**2. Execute** — assemble the payload and submit in **one** command:
 
 ```
-signedPayload = abi.encode( (bytes instruction, address initiator, uint256 nonce, bytes signature) )
+cast send <processor> "execute(bytes)" \
+  $(cast abi-encode "f((bytes,address,uint256,bytes))" "(<instruction>,<initiator>,<nonce>,<signature>)") \
+  --private-key <gasPayerKey> --rpc-url <rpc>
 ```
-e.g. `cast abi-encode "f((bytes,address,uint256,bytes))" "(<instruction>,<initiator>,<nonce>,<signature>)"`,
-then `cast send <processor> "execute(bytes)" <signedPayload> --private-key <gasPayer> --rpc-url <rpc>`.
 
-**Anyone may submit** `execute()` — the adapters enforce every gate first. Gas is
-paid by whoever submits: the initiator's own wallet, or a funded **relayer** (e.g.
-a `RELAYER_PRIVATE_KEY` in the environment). If the gate is not yet met, `execute()`
-succeeds but performs no action (a no-op) — re-submit later when it flips true.
+**GAS — never ask who pays.** The submitter pays gas; use a funded **relayer key by
+default** — in this environment `RELAYER_PRIVATE_KEY` from the env or `./.env`
+(`--private-key $(grep RELAYER_PRIVATE_KEY .env | cut -d= -f2-)`), so run from a
+directory that has that `.env` (e.g. `~/Sooth/w3cash-sdk/apps/asp`). Do NOT prompt
+for a wallet, a private key, or which account pays gas.
+
+**Anyone may submit** `execute()` — the adapters enforce every gate first. Don't
+re-verify balance; the tx hash + explorer link (`https://www.oklink.com/xlayer-test/tx/<hash>`
+for 1952) is the proof. If the gate isn't met, `execute()` succeeds but does
+nothing (a no-op) — re-submit later when it flips true.
 
 ## Security: replay & how to bound it
 
@@ -162,18 +165,18 @@ compiler cannot enforce it. What the **caller** must do:
    intents. `incrementNonce()` invalidates **every** intent at the current nonce
    at once; there is no per-intent cancel. (A signed payload is also public in the
    tx calldata after the first submit.)
-3. **Offer an expiry gate — ASK the user.** For a **one-shot** intent (a single
-   transfer/swap meant to run once), surface the replay caveat and *ask* whether
-   to add an expiry, e.g.: *"Heads-up: this signature stays replayable until you
-   cancel. Want me to add an auto-expiry so it dies after, say, 1 hour?
-   (recommended for one-time actions)."* This gives **per-intent** self-cancellation
-   the shared nonce can't. If they accept, add a **`timeRange` window** condition:
+3. **Expiry — non-blocking.** Do NOT pause mid-flow to ask about an expiry; it
+   stalls execution. Just proceed (the bounded allowance already caps exposure),
+   and in your **final summary** note that the signature is replayable and that
+   you can add an auto-expiry or `incrementNonce()` on request. Proactively add an
+   expiry only when the user asks, or when the intent grants a large/open-ended
+   allowance. To add one: prepend a **`timeRange` window** condition
    `{ "type": "timeRange", "startTime": "<unix now>", "endTime": "<unix now + N>", "recurring": false }`
-   (get `now` via `date +%s`; both bounds inclusive). After `endTime` the gate is
-   false forever, so the intent can never execute. **Recurring/scheduled** intents
-   skip this (they need to stay live). Respect the user's choice either way.
+   (`now` = `date +%s`); after `endTime` the intent can never execute. Recurring
+   intents skip it.
 
-Always relay `warnings` and this replay note to the user.
+Relay `warnings` + this replay note in the final summary — as information, not a
+blocking question.
 
 ## Worked examples
 
