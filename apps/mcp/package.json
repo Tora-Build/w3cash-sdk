@@ -1,0 +1,38 @@
+{
+  "name": "@w3cash/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for the W3Cash Intent Compiler ASP — lets any AI agent compile non-custodial 'do X only when Y' on-chain intents in natural language.",
+  "bin": {
+    "w3cash-mcp": "dist/stdio.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SKILL.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "postbuild": "node -e \"for (const f of ['dist/stdio.js','dist/http.js']) require('fs').chmodSync(f, 0o755)\"",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/http.js",
+    "start:stdio": "node dist/stdio.js",
+    "dev": "tsx watch src/http.ts",
+    "dev:stdio": "tsx watch src/stdio.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

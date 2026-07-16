@@ -153,6 +153,134 @@ export const ADAPTERS = {
   },
 } as const satisfies Record<string, AdapterInfo>;
 
+/** Union of every adapter key (transfer/approve/swap/…/signature). */
+export type AdapterKey = keyof typeof ADAPTERS;
+
+// ---------------------------------------------------------------------------
+// Multi-chain deployment registry
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-chain deployment config. `adapters` is a PARTIAL map — a chain lists only
+ * the adapters actually deployed there. A request needing an adapter this chain
+ * does not deploy is rejected with a ValidationError naming the chain (see
+ * requireAdapter). Both supported chains use local chain INDEX 0 in their
+ * AdapterRegistry (getChain(0) == chainId), so encodeOperation's LOCAL_CHAIN_INDEX
+ * is correct for either.
+ */
+export interface ChainConfig {
+  readonly chainId: number;
+  readonly chainName: string;
+  readonly processor: Address;
+  readonly adapterRegistry: Address;
+  readonly localChainIndex: number;
+  readonly adapters: Partial<Record<AdapterKey, AdapterInfo>>;
+}
+
+// --- X Layer testnet (chainId 1952) — minimal core, no external-protocol legs ---
+// Deployed 2026-07-15 via DeployXLayerCore.s.sol. Uniswap/Aave/Across/Chainlink
+// are absent on X Layer, so Swap/Aave/Wrap/Bridge are intentionally NOT deployed.
+// registry.setChain(0, 1952) was configured so the processor's local-routing
+// check (getChain(op.chain) == block.chainid) passes for chain-index 0 ops.
+export const XLAYER_CHAIN_ID = 1952 as const;
+
+export const XLAYER_PROCESSOR: Address = getAddress(
+  "0x3C06E44bD4d09328a4c374174b8e325c0C674b6E"
+);
+
+export const XLAYER_ADAPTER_REGISTRY: Address = getAddress(
+  "0x58F35BE6A5e3D2be4C3575853043322B02FEeD84"
+);
+
+/**
+ * X Layer testnet adapters. Same contract types as Base Sepolia (identical bytes4
+ * self-tags), different addresses. registryId is null for all: only setChain was
+ * configured on X Layer — adapters route by ADDRESS on the local path and none
+ * were registered in the AdapterRegistry uint8 id space (which local exec ignores
+ * anyway). Every address was returned by DeployXLayerCore's broadcast.
+ */
+export const XLAYER_ADAPTERS = {
+  transfer: {
+    name: "TransferAdapter",
+    address: getAddress("0xbc7b155057Bb78BB8bF9c9F9Fa6bFCc931aEAF38"),
+    adapterId: "0xecbe83c0",
+    registryId: null,
+    deployed: true,
+  },
+  approve: {
+    name: "ApproveAdapter",
+    address: getAddress("0x1aF3cB8B270Db3e71fC979543c32B87709EA191f"),
+    adapterId: "0x61da13e4",
+    registryId: null,
+    deployed: true,
+  },
+  wait: {
+    name: "WaitAdapter",
+    address: getAddress("0x8629b9ca457F4088ec8346FAED61DA858FDB498d"),
+    adapterId: "0x05bdc82b",
+    registryId: null,
+    deployed: true,
+  },
+  query: {
+    name: "QueryAdapter",
+    address: getAddress("0x50293aD4e42593A8b081960c991c198729E81192"),
+    adapterId: "0x7485829c",
+    registryId: null,
+    deployed: true,
+  },
+  gasPrice: {
+    name: "GasPriceAdapter",
+    address: getAddress("0x12A38bc9E3bD2359265cE70451777eDe2fd875A3"),
+    adapterId: "0x62c7743a",
+    registryId: null,
+    deployed: true,
+  },
+  timeRange: {
+    name: "TimeRangeAdapter",
+    address: getAddress("0xBE566c267A0D350e1D647Ccb621cC657FA3a1d50"),
+    adapterId: "0x79b4e21f",
+    registryId: null,
+    deployed: true,
+  },
+  signature: {
+    name: "SignatureAdapter",
+    address: getAddress("0xaa3Ffae62A8Af00d08Ac395e9551776b0A01E492"),
+    adapterId: "0xfde104a6",
+    registryId: null,
+    deployed: true,
+  },
+} as const satisfies Partial<Record<AdapterKey, AdapterInfo>>;
+
+/** Base Sepolia (84532) — the DEFAULT chain, full adapter set. */
+export const BASE_SEPOLIA_CONFIG: ChainConfig = {
+  chainId: CHAIN_ID,
+  chainName: "Base Sepolia",
+  processor: PROCESSOR,
+  adapterRegistry: ADAPTER_REGISTRY,
+  localChainIndex: LOCAL_CHAIN_INDEX,
+  adapters: ADAPTERS,
+};
+
+/** X Layer testnet (1952) — minimal core (transfer/approve + all gate adapters). */
+export const XLAYER_CONFIG: ChainConfig = {
+  chainId: XLAYER_CHAIN_ID,
+  chainName: "X Layer testnet",
+  processor: XLAYER_PROCESSOR,
+  adapterRegistry: XLAYER_ADAPTER_REGISTRY,
+  localChainIndex: LOCAL_CHAIN_INDEX, // getChain(0) == 1952 (setChain(0,1952))
+  adapters: XLAYER_ADAPTERS,
+};
+
+/** Supported execution chains, keyed by REAL chainId. */
+export const CHAINS: Record<number, ChainConfig> = {
+  [CHAIN_ID]: BASE_SEPOLIA_CONFIG,
+  [XLAYER_CHAIN_ID]: XLAYER_CONFIG,
+};
+
+export const SUPPORTED_CHAIN_IDS: readonly number[] = Object.values(CHAINS).map(
+  (c) => c.chainId
+);
+
 /** bytes8 field-4 selector — DEAD per W3CashProcessor.sol:159, always zero. */
 const DEAD_SELECTOR: Hex = "0x0000000000000000";
 
@@ -357,7 +485,7 @@ export type ConditionRequest =
     };
 
 export interface CompileRequest {
-  chain?: Numeric; // must resolve to 84532 or local index 0 (default: local)
+  chain?: Numeric; // 84532 Base Sepolia (default) or 1952 X Layer testnet
   nonce?: Numeric; // signer's current on-chain nonce (default 0)
   seq?: Numeric; // starting seq in header (default 0)
   initiator?: string; // optional; echoed into summary, not required
@@ -701,7 +829,10 @@ export function signatureMessageHash(params: {
   account: string;
   actionHash: string;
   deadline: Numeric;
+  chain?: Numeric; // default: Base Sepolia (84532)
 }): Hex {
+  const cfg = resolveChain(params.chain);
+  const sigAdapter = requireAdapter(cfg, "signature", "signature");
   const account = addr(params.account, "signatureMessageHash.account");
   const actionHash = bytes32(params.actionHash, "signatureMessageHash.actionHash");
   const deadline = toUint(
@@ -712,7 +843,7 @@ export function signatureMessageHash(params: {
   return keccak256(
     encodePacked(
       ["address", "bytes32", "uint256", "uint256", "address"],
-      [account, actionHash, deadline, BigInt(CHAIN_ID), ADAPTERS.signature.address]
+      [account, actionHash, deadline, BigInt(cfg.chainId), sigAdapter.address]
     )
   );
 }
@@ -730,7 +861,7 @@ interface EncodedStep {
   warnings?: readonly string[];
 }
 
-function encodeAction(action: ActionRequest): EncodedStep {
+function encodeAction(action: ActionRequest, cfg: ChainConfig): EncodedStep {
   switch (action.type) {
     case "transfer": {
       const token = addr(action.token, "transfer.token");
@@ -742,7 +873,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.transfer,
+        adapter: requireAdapter(cfg, "transfer", "transfer"),
         value: toUint(action.value ?? 0, "transfer.value", UINT_MAX.u112),
         summary: `Transfer ${amount.toString()} of ${token} to ${to} (initiator must approve TransferAdapter first)`,
       };
@@ -757,7 +888,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.approve,
+        adapter: requireAdapter(cfg, "approve", "approve"),
         value: toUint(action.value ?? 0, "approve.value", UINT_MAX.u112),
         summary: `Approve ${spender} for ${amount.toString()} of ${token} (allowance is granted FROM the adapter, not the user's EOA)`,
       };
@@ -774,7 +905,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.swap,
+        adapter: requireAdapter(cfg, "swap", "swap"),
         value: toUint(action.value ?? 0, "swap.value", UINT_MAX.u112),
         summary: `Swap ${amountIn.toString()} ${tokenIn} -> ${tokenOut} (minOut ${minOut.toString()}, feeTier ${feeTier.toString()}); initiator must approve SwapAdapter first`,
       };
@@ -792,7 +923,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       const input = concat([AAVE_OP.deposit, params]);
       return {
         input,
-        adapter: ADAPTERS.aave,
+        adapter: requireAdapter(cfg, "aave", action.type),
         value: toUint(action.value ?? 0, "aaveDeposit.value", UINT_MAX.u112),
         summary: `Aave supply ${amount.toString()} of ${token} on behalf of initiator (approve AaveAdapter for the underlying first)`,
       };
@@ -810,7 +941,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       const input = concat([AAVE_OP.withdraw, params]);
       return {
         input,
-        adapter: ADAPTERS.aave,
+        adapter: requireAdapter(cfg, "aave", action.type),
         value: toUint(action.value ?? 0, "aaveWithdraw.value", UINT_MAX.u112),
         summary: `Aave withdraw ${amount.toString()} of ${token} (approve AaveAdapter for the aToken first; aToken must be registered)`,
       };
@@ -821,7 +952,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       const input = concat([AAVE_OP.withdrawAll, params]);
       return {
         input,
-        adapter: ADAPTERS.aave,
+        adapter: requireAdapter(cfg, "aave", action.type),
         value: toUint(action.value ?? 0, "aaveWithdrawAll.value", UINT_MAX.u112),
         summary: `Aave withdraw ALL of ${token} (approve AaveAdapter for the aToken first)`,
       };
@@ -842,7 +973,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
         : toUint(action.value ?? 0, "wrap.value", UINT_MAX.u112);
       return {
         input,
-        adapter: ADAPTERS.wrap,
+        adapter: requireAdapter(cfg, "wrap", "wrap"),
         value,
         summary: action.isWrap
           ? `Wrap ${amount.toString()} wei ETH -> WETH (op forwards ${value.toString()} wei as msg.value to fund the adapter)`
@@ -929,7 +1060,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.bridge,
+        adapter: requireAdapter(cfg, "bridge", "bridge"),
         value: toUint(action.value ?? 0, "bridge.value", UINT_MAX.u112),
         summary: `Bridge ${inputAmount.toString()} of ${inputToken} from Base Sepolia to chain ${destinationChainId.toString()} for ${outputAmount.toString()} of ${
           outputToken === ZERO_ADDRESS ? "auto/wrapped-native" : outputToken
@@ -949,7 +1080,7 @@ function encodeAction(action: ActionRequest): EncodedStep {
   }
 }
 
-function encodeCondition(cond: ConditionRequest): EncodedStep {
+function encodeCondition(cond: ConditionRequest, cfg: ChainConfig): EncodedStep {
   switch (cond.type) {
     case "waitTime": {
       const value = toUint(cond.timestamp, "waitTime.timestamp", UINT_MAX.u256);
@@ -959,7 +1090,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.wait,
+        adapter: requireAdapter(cfg, "wait", cond.type),
         value: 0n,
         summary: `Wait until unix timestamp >= ${value.toString()}`,
       };
@@ -972,7 +1103,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.wait,
+        adapter: requireAdapter(cfg, "wait", cond.type),
         value: 0n,
         summary: `Wait until block number >= ${value.toString()}`,
       };
@@ -989,7 +1120,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.wait,
+        adapter: requireAdapter(cfg, "wait", cond.type),
         value: 0n,
         summary: `Wait until Chainlink feed ${feed} price ${
           cond.type === "waitPriceGte" ? ">=" : "<="
@@ -1010,7 +1141,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       const input = queryInput(token, balanceOfCalldata(holder), operator, threshold);
       return {
         input,
-        adapter: ADAPTERS.query,
+        adapter: requireAdapter(cfg, "query", cond.type),
         value: 0n,
         summary: `Gate (QueryAdapter): ERC20 ${token}.balanceOf(${holder}) ${operatorSymbol(
           operator
@@ -1044,7 +1175,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.query,
+        adapter: requireAdapter(cfg, "query", cond.type),
         value: 0n,
         summary: `Gate (QueryAdapter): Chainlink feed ${feed}.latestAnswer() ${operatorSymbol(
           operator
@@ -1084,7 +1215,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.timeRange,
+        adapter: requireAdapter(cfg, "timeRange", "timeRange"),
         value: 0n,
         summary: `Gate (TimeRangeAdapter): execute only within ${window}`,
         warnings,
@@ -1099,7 +1230,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       ]);
       return {
         input,
-        adapter: ADAPTERS.gasPrice,
+        adapter: requireAdapter(cfg, "gasPrice", "gasPrice"),
         value: 0n,
         summary: `Gate (GasPriceAdapter): tx.gasprice ${operatorSymbol(
           operator
@@ -1125,7 +1256,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.signature,
+        adapter: requireAdapter(cfg, "signature", "signature"),
         value: 0n,
         summary: `Gate (SignatureAdapter): require co-signer ${requiredSigner} to have personal-signed action ${actionHash} (deadline ${deadline.toString()})`,
         warnings: [
@@ -1143,7 +1274,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       );
       return {
         input,
-        adapter: ADAPTERS.query,
+        adapter: requireAdapter(cfg, "query", cond.type),
         value: 0n,
         summary: `Gate (QueryAdapter): Sooth market ${market}.isSettled() == true (proceed only once the prediction market has settled)`,
       };
@@ -1162,7 +1293,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
         `outcome ${outcome.toString()}`;
       return {
         input,
-        adapter: ADAPTERS.query,
+        adapter: requireAdapter(cfg, "query", cond.type),
         value: 0n,
         summary: `Gate (QueryAdapter): Sooth market ${market}.winningOutcome() == ${outcome.toString()} (${label})`,
       };
@@ -1175,7 +1306,7 @@ function encodeCondition(cond: ConditionRequest): EncodedStep {
       const input = queryInput(target, calldata, operator, expected);
       return {
         input,
-        adapter: ADAPTERS.query,
+        adapter: requireAdapter(cfg, "query", cond.type),
         value: 0n,
         summary: `Gate: staticcall ${target} (uint256 result) ${operatorSymbol(
           operator
@@ -1195,6 +1326,51 @@ function operatorSymbol(op: number): string {
   return (["<", ">", "<=", ">=", "==", "!="] as const)[op] ?? `op(${op})`;
 }
 
+/**
+ * Resolve a request `chain` value to a ChainConfig. Accepts a real chainId
+ * (84532 Base Sepolia / 1952 X Layer testnet) or, for backward compat, the
+ * legacy local INDEX 0 (=> Base Sepolia, the historical "local" alias).
+ * Undefined => Base Sepolia (default). Anything else throws ValidationError
+ * (so an unsupported chain like `1` is rejected, as the tests require).
+ */
+export function resolveChain(chain?: Numeric): ChainConfig {
+  if (chain === undefined || chain === null) return BASE_SEPOLIA_CONFIG;
+  const c = toBigInt(chain, "chain");
+  if (c === BigInt(LOCAL_CHAIN_INDEX)) return BASE_SEPOLIA_CONFIG; // legacy index-0 alias
+  const cfg = CHAINS[Number(c)];
+  if (!cfg) {
+    throw new ValidationError(
+      `unsupported chain ${c.toString()}; supported: ${SUPPORTED_CHAIN_IDS.join(
+        ", "
+      )} (Base Sepolia / X Layer testnet). Pass the real chainId.`
+    );
+  }
+  return cfg;
+}
+
+/**
+ * Fetch the deployed adapter for `key` on `cfg`, or throw a ValidationError
+ * naming the chain if this chain does not deploy it. This is how per-chain
+ * availability is enforced: e.g. `swap`/`aaveDeposit`/`wrap`/`bridge` on X Layer
+ * (no Uniswap/Aave/Across there) are rejected here, while every gate adapter is
+ * present on both chains.
+ */
+function requireAdapter(
+  cfg: ChainConfig,
+  key: AdapterKey,
+  type: string
+): AdapterInfo {
+  const a = cfg.adapters[key];
+  if (!a) {
+    throw new ValidationError(
+      `'${type}' is not available on ${cfg.chainName} (chainId ${
+        cfg.chainId
+      }); this chain deploys only: ${Object.keys(cfg.adapters).join(", ")}`
+    );
+  }
+  return a;
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -1204,15 +1380,9 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     throw new ValidationError("request body must be a JSON object");
   }
 
-  // Chain gate: only local Base Sepolia (chainId 84532 or index 0) is buildable.
-  if (request.chain !== undefined) {
-    const c = toBigInt(request.chain, "chain");
-    if (c !== BigInt(CHAIN_ID) && c !== BigInt(LOCAL_CHAIN_INDEX)) {
-      throw new ValidationError(
-        `unsupported chain ${c.toString()}; only Base Sepolia (${CHAIN_ID}) / local index ${LOCAL_CHAIN_INDEX} is supported`
-      );
-    }
-  }
+  // Chain gate: resolve the target chain (Base Sepolia 84532 default, or X Layer
+  // testnet 1952). resolveChain throws ValidationError on an unsupported chain.
+  const cfg = resolveChain(request.chain);
 
   const nonce = toUint(request.nonce ?? 0, "nonce", UINT_MAX.u256);
   const seq = toUint(request.seq ?? 0, "seq", UINT_MAX.u256);
@@ -1277,7 +1447,7 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     if (cond === null || typeof cond !== "object" || typeof cond.type !== "string") {
       throw new ValidationError("each condition must be an object with a `type`");
     }
-    pushStep("condition", cond.type, encodeCondition(cond));
+    pushStep("condition", cond.type, encodeCondition(cond, cfg));
   }
   for (const action of actions) {
     if (
@@ -1287,7 +1457,7 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     ) {
       throw new ValidationError("each action must be an object with a `type`");
     }
-    pushStep("action", action.type, encodeAction(action));
+    pushStep("action", action.type, encodeAction(action, cfg));
   }
 
   // seq is the processor's resumption cursor: `for (; seq < length;)`
@@ -1330,15 +1500,15 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
   const humanSummary: string[] = [];
   if (initiator) humanSummary.push(`Initiator: ${initiator}`);
   humanSummary.push(
-    `Chain: Base Sepolia (${CHAIN_ID}); Processor: ${PROCESSOR}; nonce ${nonce.toString()}`
+    `Chain: ${cfg.chainName} (${cfg.chainId}); Processor: ${cfg.processor}; nonce ${nonce.toString()}`
   );
   for (const s of steps) {
     humanSummary.push(`#${s.index} [${s.kind}/${s.type}] ${s.summary}`);
   }
 
   return {
-    chainId: CHAIN_ID,
-    processor: PROCESSOR,
+    chainId: cfg.chainId,
+    processor: cfg.processor,
     nonce: nonce.toString(),
     seq: seq.toString(),
     operations,
@@ -1383,6 +1553,17 @@ export const REPLAY_CAVEAT: ReplayCaveat = {
     "Call incrementNonce() on the W3CashProcessor (0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE) to invalidate every outstanding signature bound to the current nonce.",
 };
 
+/** Per-chain replay caveat — same text, with that chain's processor address in
+ *  the cancel instruction. Base Sepolia returns the frozen REPLAY_CAVEAT above. */
+export function replayCaveatFor(cfg: ChainConfig): ReplayCaveat {
+  if (cfg.chainId === CHAIN_ID) return REPLAY_CAVEAT;
+  return {
+    replayable: true,
+    caveat: REPLAY_CAVEAT.caveat,
+    cancel: `Call incrementNonce() on the W3CashProcessor (${cfg.processor}) to invalidate every outstanding signature bound to the current nonce.`,
+  };
+}
+
 /** Accurate, self-describing counts (no '18 actions' overclaim). */
 export interface CapabilityCounts {
   readonly actionTypes: number;
@@ -1421,31 +1602,9 @@ export interface CapabilityCatalog {
   readonly notes: readonly string[];
 }
 
-export function getCapabilities(): CapabilityCatalog {
-  return {
-    chainId: CHAIN_ID,
-    chainName: "Base Sepolia",
-    processor: PROCESSOR,
-    adapterRegistry: ADAPTER_REGISTRY,
-    localChainIndex: LOCAL_CHAIN_INDEX,
-    operators: { ...OPERATORS },
-    gasPriceOperators: { ...GAS_OPERATORS },
-    marketOutcomes: { ...MARKET_OUTCOME },
-    counts: {
-      // 8 action TYPES over 6 deployed action adapters (3 aave* types share
-      // AaveAdapter); 12 condition TYPES over 5 deployed condition adapters
-      // (4 wait* share WaitAdapter; balance/price/query/marketResolved/
-      // marketOutcome share QueryAdapter). 11 deployed adapters total.
-      actionTypes: 8,
-      conditionTypes: 12,
-      deployedActionAdapters: 6,
-      deployedConditionAdapters: 5,
-      deployedAdapters: 11,
-    },
-    summary:
-      "8 action types + 12 condition types, backed by 11 on-chain-verified adapters on Base Sepolia (6 action adapters: Transfer/Approve/Swap/Aave/Wrap/Bridge; 5 condition adapters: Wait/Query/TimeRange/GasPrice/Signature).",
-    replay: REPLAY_CAVEAT,
-    actions: [
+/** Full action catalog (Base Sepolia superset). getCapabilities filters this to
+ *  the adapters actually deployed on the requested chain (by `adapter` name). */
+const ACTION_CAPS: CapabilityCatalog["actions"] = [
       {
         type: "transfer",
         adapter: "TransferAdapter",
@@ -1514,8 +1673,10 @@ export function getCapabilities(): CapabilityCatalog {
         requiresPriorApprove: true,
         note: "Across depositV3 to destinationChainId (REAL EVM chain id). ERC20 only (bridge WETH; native ETH unsupported). outputAmount/quoteTimestamp should come from the Across suggested-fees quote; fillDeadline must be in [now, now+21600s] and non-zero. Approve BridgeAdapter for inputToken first.",
       },
-    ],
-    conditions: [
+];
+
+/** Full condition catalog (Base Sepolia superset), filtered per-chain like ACTION_CAPS. */
+const CONDITION_CAPS: CapabilityCatalog["conditions"] = [
       {
         type: "waitTime",
         adapter: "WaitAdapter",
@@ -1588,20 +1749,62 @@ export function getCapabilities(): CapabilityCatalog {
         fields: ["market", "outcome"],
         note: "Convenience gate: Sooth TruthMarket.winningOutcome() == outcome (0=NO,1=YES,2=INVALID, or the names). Compiles to a QueryAdapter staticcall.",
       },
-    ],
-    adapterCatalog: Object.entries(ADAPTERS).map(([key, info]) => ({
+];
+
+/**
+ * Capability catalog for one chain. Defaults to Base Sepolia (84532); pass 1952
+ * for X Layer testnet. Actions/conditions are filtered to the adapters actually
+ * deployed on the requested chain, and the counts are derived from that filter —
+ * so X Layer (no Swap/Aave/Wrap/Bridge) reports 2 action types, Base Sepolia 8.
+ */
+export function getCapabilities(chain?: Numeric): CapabilityCatalog {
+  const cfg = resolveChain(chain);
+  const availableNames = new Set(
+    Object.values(cfg.adapters).map((a) => a.name)
+  );
+  const actions = ACTION_CAPS.filter((a) => availableNames.has(a.adapter));
+  const conditions = CONDITION_CAPS.filter((c) => availableNames.has(c.adapter));
+  const actionAdapterNames = new Set(actions.map((a) => a.adapter));
+  const conditionAdapterNames = new Set(conditions.map((c) => c.adapter));
+  const deployedAdapters = Object.keys(cfg.adapters).length;
+  const queryAddr = cfg.adapters.query?.address ?? ZERO_ADDRESS;
+  const liveAdapterNames = Object.values(cfg.adapters)
+    .map((a) => a.name.replace(/Adapter$/, ""))
+    .join(", ");
+  return {
+    chainId: cfg.chainId,
+    chainName: cfg.chainName,
+    processor: cfg.processor,
+    adapterRegistry: cfg.adapterRegistry,
+    localChainIndex: cfg.localChainIndex,
+    operators: { ...OPERATORS },
+    gasPriceOperators: { ...GAS_OPERATORS },
+    marketOutcomes: { ...MARKET_OUTCOME },
+    counts: {
+      actionTypes: actions.length,
+      conditionTypes: conditions.length,
+      deployedActionAdapters: actionAdapterNames.size,
+      deployedConditionAdapters: conditionAdapterNames.size,
+      deployedAdapters,
+    },
+    summary: `${actions.length} action types + ${conditions.length} condition types, backed by ${deployedAdapters} on-chain-verified adapters on ${cfg.chainName} (${cfg.chainId}).`,
+    replay: replayCaveatFor(cfg),
+    actions,
+    conditions,
+    adapterCatalog: Object.entries(cfg.adapters).map(([key, info]) => ({
       key,
-      ...info,
+      ...(info as AdapterInfo),
     })),
     notes: [
+      `Chain: ${cfg.chainName} (${cfg.chainId}); processor ${cfg.processor}. Deployed adapters: ${Object.keys(cfg.adapters).join(", ")}.`,
       "Local (same-chain) routing is by the operation's `target` ADDRESS (W3CashProcessor.sol:176); field-1 `amb` is ignored locally and is left 0.",
       "field-4 selector (bytes8) is dead and left 0; field-2 fee (uint64) is cross-chain-only and left 0.",
       "Signature scheme is EIP-191 personal_sign over keccak256(abi.encodePacked(keccak256(payload), nonce)) — NOT EIP-712.",
       "execute() does NOT consume the nonce; a signed payload is replayable until the initiator calls incrementNonce() — see the `replay` field.",
-      "balance/price/marketResolved/marketOutcome all compile to the ONE deployed QueryAdapter (0x4bC2F784...) — there is no separate Balance or Price adapter on Base Sepolia.",
+      `balance/price/marketResolved/marketOutcome all compile to the ONE deployed QueryAdapter (${queryAddr}) — there is no separate Balance or Price adapter.`,
       "TimeRangeAdapter and GasPriceAdapter are reachable ONLY by direct address (registryId null); they are not in the AdapterRegistry uint8 id space.",
       "GasPriceAdapter uses a REDUCED operator set (lt/gt/lte/gte); it has no eq/neq. See `gasPriceOperators`.",
-      "Live adapters: Wait, Query, Aave, Transfer, Approve, Swap, Wrap, Bridge, TimeRange, GasPrice, Signature. Other *.sol adapters in the contracts repo (Borrow/Repay/Vote/HealthFactor/…) are NOT registered/deployed on Base Sepolia — do not target them.",
+      `Live adapters on ${cfg.chainName}: ${liveAdapterNames}. Other *.sol adapters in the contracts repo are NOT registered/deployed here — do not target them.`,
     ],
   };
 }
@@ -1624,6 +1827,17 @@ export const KNOWN_ADDRESSES = {
   sampleWallet: getAddress("0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"), // example recipient/holder
 } as const;
 
+/**
+ * Well-known X Layer testnet (1952) addresses for the X Layer recipe set. The
+ * minimal core has no Uniswap/Aave/Across/Chainlink, so X Layer recipes use only
+ * transfer/approve + the time/block/gas/query/co-signer gates. USD₮0 is the OKX
+ * X Layer testnet USDT (also the x402 settlement asset).
+ */
+export const XLAYER_KNOWN_ADDRESSES = {
+  usdt0: getAddress("0x9e29b3aada05bf2d2c827af80bd28dc0b9b4fb0c"), // USD₮0 (X Layer testnet)
+  sampleWallet: getAddress("0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"), // example recipient/holder
+} as const;
+
 export interface Recipe {
   readonly id: string;
   readonly title: string;
@@ -1643,11 +1857,84 @@ export interface RecipeBook {
 }
 
 /**
+ * X Layer testnet (1952) recipe set. The minimal core has no swap/aave/bridge, so
+ * these use only transfer + the time/gas/balance gates over USD₮0. Each request
+ * pins chain:1952 so /compile-intent routes to the X Layer processor. These are
+ * the intents an OKX Agentic Wallet can sign (no PK export) and settle gas-free.
+ */
+function getXLayerRecipes(cfg: ChainConfig): RecipeBook {
+  const K = XLAYER_KNOWN_ADDRESSES;
+  return {
+    chainId: cfg.chainId,
+    processor: cfg.processor,
+    replay: replayCaveatFor(cfg),
+    demoMarket: ZERO_ADDRESS, // no Sooth market deployed on X Layer testnet
+    recipes: [
+      {
+        id: "scheduled-transfer",
+        title: "Scheduled transfer: wait until a time, then send USD₮0",
+        description:
+          "WaitAdapter holds until the unix timestamp, then TransferAdapter moves USD₮0 to the recipient. Initiator must approve the X Layer TransferAdapter for USD₮0 first. Re-sign with a new timestamp for each run.",
+        request: {
+          chain: cfg.chainId,
+          conditions: [{ type: "waitTime", timestamp: "1767225600" }],
+          actions: [
+            { type: "transfer", token: K.usdt0, to: K.sampleWallet, amount: "1000000" },
+          ],
+        },
+      },
+      {
+        id: "gas-gated-transfer",
+        title: "Gas-gated transfer: only settle when gas is cheap",
+        description:
+          "GasPriceAdapter gates until the settling tx's gas price is <= 5 gwei, then TransferAdapter sends USD₮0. Useful to defer a payout until the network is quiet. Approve the X Layer TransferAdapter for USD₮0 first.",
+        request: {
+          chain: cfg.chainId,
+          conditions: [{ type: "gasPrice", operator: "lte", threshold: "5000000000" }],
+          actions: [
+            { type: "transfer", token: K.usdt0, to: K.sampleWallet, amount: "1000000" },
+          ],
+        },
+      },
+      {
+        id: "balance-gated-transfer",
+        title: "Balance-gated transfer: send only once a wallet is funded",
+        description:
+          "QueryAdapter staticcalls USD₮0.balanceOf(holder) and gates until it is >= the threshold, then TransferAdapter sends. A do-X-only-when-Y payout conditioned purely on on-chain state. Approve the X Layer TransferAdapter for USD₮0 first.",
+        request: {
+          chain: cfg.chainId,
+          conditions: [
+            {
+              type: "balance",
+              token: K.usdt0,
+              target: K.sampleWallet,
+              operator: "gte",
+              threshold: "1000000",
+            },
+          ],
+          actions: [
+            { type: "transfer", token: K.usdt0, to: K.sampleWallet, amount: "1000000" },
+          ],
+        },
+      },
+    ],
+    notes: [
+      `X Layer testnet (${cfg.chainId}) minimal core: transfer/approve + time/block/gas/query/co-signer gates only. No swap/aave/wrap/bridge (Uniswap/Aave/Across absent).`,
+      "Every recipe compiles to a REPLAYABLE signature (see `replay`); cancel with incrementNonce().",
+      "USD₮0 (0x9e29...) is the X Layer testnet USDT; amounts are in its smallest unit. Approve the X Layer TransferAdapter for USD₮0 before signing a transfer intent.",
+      "POST any recipe's `request` object to /compile-intent to get the signable envelope.",
+    ],
+  };
+}
+
+/**
  * Five canned recipes, each using ONLY on-chain-verified deployed adapters:
  * scheduled DCA, buy-the-dip, Aave stop-loss, cross-chain sweep, and a
  * prediction-gated withdraw against the settled demo market.
  */
-export function getRecipes(): RecipeBook {
+export function getRecipes(chain?: Numeric): RecipeBook {
+  const cfg = resolveChain(chain);
+  if (cfg.chainId === XLAYER_CHAIN_ID) return getXLayerRecipes(cfg);
   const K = KNOWN_ADDRESSES;
   return {
     chainId: CHAIN_ID,
@@ -1755,7 +2042,7 @@ export function getRecipes(): RecipeBook {
         id: "prediction-gated-withdraw",
         title: "Prediction-gated withdraw: once the market resolves YES, transfer USDC",
         description:
-          "QueryAdapter staticcalls the Sooth TruthMarket's winningOutcome() and gates until it equals 1 (YES); then TransferAdapter moves USDC to the recipient. The demo market is already settled YES, so this gate passes immediately. Swap in marketResolved{market} to gate on settlement regardless of outcome. Approve TransferAdapter for USDC first.",
+          "QueryAdapter staticcalls the Sooth TruthMarket's winningOutcome() and gates until it equals 1 (YES); then TransferAdapter moves USDC to the recipient. This example market is already settled YES, so this gate passes immediately. Swap in marketResolved{market} to gate on settlement regardless of outcome. Approve TransferAdapter for USDC first.",
         request: {
           chain: CHAIN_ID,
           conditions: [

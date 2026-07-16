@@ -1,0 +1,21 @@
+{
+  "name": "@w3cash/playground",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Human-facing demo playground for the W3Cash Intent Compiler ASP (A2MCP agent service).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.5",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "vite": "^6.0.7",
+    "vite-plugin-solid": "^2.11.2"
+  }
+}

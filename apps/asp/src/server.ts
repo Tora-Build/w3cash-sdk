@@ -18,6 +18,7 @@ import {
 } from "./w3cash/encode.js";
 import { buildX402Middleware } from "./x402.js";
 import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
+import { LANDING_HTML } from "./landing.js";
 
 const app = express();
 
@@ -76,19 +77,45 @@ const paymentConfig = {
 const x402Middleware = await buildX402Middleware(paymentConfig);
 if (x402Middleware) app.use(x402Middleware);
 
+// Landing page at the root — a read-only, self-contained visual of the live
+// service (renders /capabilities prettily). Static HTML; no wallet/execution.
+app.get("/", (_req: Request, res: Response) => {
+  res.status(200).type("html").send(LANDING_HTML);
+});
+
 // Health / self-check endpoint (used by OKX A2MCP endpoint verification).
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true, service: "w3cash-intent-compiler" });
 });
 
 // Capability discovery — supported actions/conditions + adapter catalog.
-app.get("/capabilities", (_req: Request, res: Response) => {
-  res.status(200).json({ ok: true, capabilities: getCapabilities() });
+// Optional ?chain=<84532|1952> selects the chain (default Base Sepolia).
+app.get("/capabilities", (req: Request, res: Response) => {
+  try {
+    const chain = typeof req.query.chain === "string" ? req.query.chain : undefined;
+    res.status(200).json({ ok: true, capabilities: getCapabilities(chain) });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
 });
 
 // Canned recipes — ready-to-POST request bodies for common automations.
-app.get("/recipes", (_req: Request, res: Response) => {
-  res.status(200).json({ ok: true, recipes: getRecipes() });
+// Optional ?chain=<84532|1952> selects the chain (default Base Sepolia).
+app.get("/recipes", (req: Request, res: Response) => {
+  try {
+    const chain = typeof req.query.chain === "string" ? req.query.chain : undefined;
+    res.status(200).json({ ok: true, recipes: getRecipes(chain) });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
 });
 
 // Live Across bridge quote — returns outputAmount/quoteTimestamp/fillDeadline for a
