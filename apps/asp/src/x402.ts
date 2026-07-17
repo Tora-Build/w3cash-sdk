@@ -58,13 +58,17 @@ export async function buildX402Middleware(
 
     console.log(`[x402] payments ENABLED — POST /compile-intent, ${price} on ${network} → ${payTo}`);
 
+    // Gate both POST (the real call) and GET (so OKX's `curl -i` self-check on the
+    // registered endpoint returns the 402 challenge regardless of method).
+    const paidRoute = {
+      accepts: [{ scheme: "exact", network: net, payTo, price }],
+      description: "W3Cash Intent Compiler — compile a signable on-chain intent",
+      mimeType: "application/json",
+    };
     return paymentMiddleware(
       {
-        "POST /compile-intent": {
-          accepts: [{ scheme: "exact", network: net, payTo, price }],
-          description: "W3Cash Intent Compiler — compile a signable on-chain intent",
-          mimeType: "application/json",
-        },
+        "POST /compile-intent": paidRoute,
+        "GET /compile-intent": paidRoute,
       },
       resourceServer
     );
