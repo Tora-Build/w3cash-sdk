@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "dotenv/config";
 /**
  * HTTP entrypoint — an Express server exposing the MCP Streamable-HTTP transport
  * at POST /mcp, so a remote agent can add the server over the network:

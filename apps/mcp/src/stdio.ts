@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "dotenv/config";
 /**
  * stdio entrypoint — for installing the W3Cash MCP server locally into an agent
  * (Claude Code / Cursor / Claude Desktop) that spawns it as a subprocess and
