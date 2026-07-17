@@ -20,6 +20,17 @@ import { buildX402Middleware } from "./x402.js";
 import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
 import { LANDING_HTML } from "./landing.js";
 
+// Backstop: a stray unhandled promise rejection (e.g. a deferred x402/facilitator
+// error) must NOT take the whole service down. Log it and keep serving — the
+// endpoint being reachable matters more than a background init hiccup. Node's
+// default behavior (crash on unhandledRejection) is what took the boot down once.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "[w3cash-asp] unhandledRejection (kept alive):",
+    reason instanceof Error ? reason.message : reason
+  );
+});
+
 const app = express();
 
 // Default to production behavior so any error path that somehow reaches

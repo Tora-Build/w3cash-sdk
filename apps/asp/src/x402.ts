@@ -33,7 +33,18 @@ export async function buildX402Middleware(
     return null;
   }
   // The SDK types network as CAIP-2 (`namespace:reference`, e.g. "eip155:1952").
-  const net = network as `${string}:${string}`;
+  // HARDENING: sanitize + validate before touching the SDK. A stray inline
+  // comment or whitespace in the env value (e.g. "eip155:1952 # note") reaches
+  // the facilitator as a malformed network and throws RouteConfigurationError —
+  // which previously escaped as an unhandled rejection and CRASHED the boot.
+  // Cut at the first whitespace/# and require the CAIP-2 shape; otherwise stay FREE.
+  const net = network.split(/[\s#]/)[0].trim() as `${string}:${string}`;
+  if (!/^[a-z0-9]+:[a-zA-Z0-9]+$/.test(net)) {
+    console.warn(
+      `[x402] NETWORK "${network}" is not a valid CAIP-2 id (parsed "${net}") — staying FREE.`
+    );
+    return null;
+  }
 
   try {
     const { paymentMiddleware, x402ResourceServer } = await import("@okxweb3/x402-express");
