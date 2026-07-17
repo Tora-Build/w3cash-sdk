@@ -125,7 +125,29 @@ channel to pass computed amounts between adapters, so per-verb is the only
 correct shape). The fix that makes recurring re-execution — the keeper's
 billable event — correct over time. Pairs with Permit2-scoped funding.
 
-### 6. Backlog + cranks
+### 6. MEV-safe swap + stop-loss *(from the CoW/MEV workflow, 2026-07-18)*
+The CoW verdict was **partial** — reject batch auctions/netting (single-user
+intents have no counterparty flow), keep only *execution-time pricing* and
+*signed-payee tip routing* (RIDER 1). Two concrete pieces:
+- **`OracleSwapAdapter`** — the fix for swap sandwiches. A UniswapV3 swap's
+  `minAmountOut` is frozen at signing (possibly weeks before execution), so the
+  trigger is public Chainlink state and the extractable band is unbounded. This
+  adapter recomputes the minOut **floor at the fire block** from a fresh
+  Chainlink read (`floor = amountIn × oraclePrice × (1 − maxSlippageBps)`, with
+  a **mandatory** staleness check floored at the feed heartbeat) + a signed
+  `executeBy` expiry. Collapses max extraction to oracle-deviation + slippage
+  and un-bricks upward-moved intents. **Pre-ADR: one-shot + exact allowance
+  only** — recurring swaps must wait for the redeploy (replay would collapse the
+  schedule). Rejected: a Dutch-decay adapter (its price anchor is set by the
+  first permissionless gate-passing call → poisonable).
+- **Buffer-over-speed stop-loss** (compiler policy, no contract): protective
+  triggers default to a safety margin *above* the liquidation threshold (fire at
+  HF 1.10, not 1.01) so the protective action and the liquidation are never valid
+  in the same block — the timing race is *designed out* rather than fought (you
+  cannot win a latency war vs Timeboost/priority-lane searchers). `keeperOfRecord
+  = address(0)` (open bounty) for this class + best-effort tip.
+
+### 7. Backlog + cranks
 - **Aave Borrow/Repay**: deploy the already-written adapters (review pass
   first); with the WordLens healthFactor gate → "repay 500 USDC when HF < 1.15".
 - **CompositeGateAdapter (OR / any-of)**: up to 8 QueryAdapter-shaped

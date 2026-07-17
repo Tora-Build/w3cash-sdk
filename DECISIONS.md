@@ -125,18 +125,96 @@ deliberately excluded, the hidden costs now booked, and resolutions to the open
 questions from the base ADR. Anything processor-level not on this list waits an
 entire redeploy cycle — err on the side of speccing now, cutting at audit.
 
+### Base-ADR corrections (2026-07-18, from the CoW/MEV mechanism-design workflow)
+
+Two **critical** findings sit *upstream* of every tip/MEV mechanism and amend the
+base ADR-0001 Decision itself — they are the load-bearing anti-MEV fixes:
+
+- **C1 — bind the full header; assert `seq == 0` always (forced-firing fix).**
+  Today's digest `keccak256(abi.encodePacked(keccak256(payload), nonce))` binds
+  only the payload + nonce, **not** the instruction header's `seq`/`length`. An
+  attacker who alters the unsigned header can make `_execute()` skip ahead and
+  run actions with **condition gates bypassed** — a master key over any intent.
+  The EIP-712 digest MUST bind the full header (`seq`, `length`, `payloadHash`),
+  and `_execute()` MUST assert `seq == 0` for **every** execution. **There is no
+  resume path and no processor-stored progress state** — PAUSE is an atomic
+  whole-intent no-op re-run from the start. *(This corrects the base ADR's
+  "resume from processor-stored progress state" language, which described storage
+  the processor does not have and contradicted the zero-new-storage claim.)*
+- **C2 — domain = the execution chain; cross-chain = multi-leg envelopes.** The
+  EIP-712 domain is `{chainId, verifyingContract}` of the processor that will run
+  the actions. A cross-chain flow is a multi-leg envelope: the destination leg is
+  a **separate sub-intent signed for the destination processor's domain**,
+  carried opaquely by `_sendCrossChainMessage`; the source processor never
+  verifies destination legs, and a source-domain signature is invalid on any
+  other chain by construction. Naive domain separation *without* this envelope
+  format would silently convert a low-severity replay into a dead bridge feature
+  — so the envelope format must be frozen in the same struct freeze.
+
 ### Riders (in the frozen spec)
 
-**RIDER 1 — Keeper tip.** Two fields in the signed EIP-712 header the base ADR
-already redefines: `{ tipToken: address, tipAmount: uint128 }`. On the
-non-pause path the processor pulls the tip from the initiator and pays
-`msg.sender`, inside the reserve-then-run CEI block under `nonReentrant`.
-Turns execution into an open, permissionless bounty marketplace (and retires
-the interim appended-transfer keeper fee from Keep Service v1).
-*Design question to resolve in the spec:* open bounties invite fire-block
-tip-sniping that expropriates whoever paid for months of monitoring — weigh a
-short priority window or commit-reveal; monitoring itself is priced separately
-via the watch tier regardless.
+**RIDER 1 — Keeper tip with signed-payee routing** *(revised after the CoW/MEV
+mechanism-design workflow, 2026-07-18 — the earlier "exclusive-then-open window"
+idea below is superseded and rejected).*
+
+Three fields in the signed EIP-712 header: `{ tipToken: address, tipAmount:
+uint128, keeperOfRecord: address }`. On the **non-pause path only**, the
+processor routes a best-effort tip: `tipRecipient = keeperOfRecord != 0 ?
+keeperOfRecord : msg.sender`. **No window fields, no time terms, no
+execution-state reads in the payout path.**
+
+- **R1.0 preconditions (non-negotiable):** ships only in the same redeploy as
+  the base-ADR execution-state + nonce-consumption + CEI (a tip on a replayable
+  signature is a drain); the digest must bind the **full instruction header
+  (seq/length/payloadHash)** and `_execute()` must assert `seq == 0` always
+  (see the base-ADR correction below); domain = the **execution** chain, with
+  cross-chain flows as multi-leg envelopes (destination leg signed for the
+  destination processor, forwarded opaquely — a source-domain signature is
+  invalid elsewhere by construction).
+- **R1.2 best-effort payout:** after all state updates, still inside
+  `nonReentrant`, attempt `tipToken.transferFrom(initiator, tipRecipient,
+  tipAmount)` as a **gas-capped (~150k) low-level call**; on failure emit
+  `TipFailed` and continue. A dry allowance degrades the intent to *untipped*
+  (recoverable by topping up — no re-sign), never bricks it. *(The atomic
+  "reverting tip reverts execution" rule is rejected: a cents-level allowance
+  grief on the shared (user, token) approval could DoS a protective action worth
+  a 5–10% liquidation penalty.)*
+- **R1.3 censorship resistance:** `execute()` stays permissionless for everyone
+  at every instant — routing touches *payment* only, never gates/delays/
+  prioritizes execution. A user censored by their keeper is executable by anyone
+  (untipped if `keeperOfRecord` set, tipped if `address(0)`).
+- **R1.4 honest scope (normative):** DOES prevent tip-theft-by-calldata-copy (a
+  sniper who copies the tx pays the tip to `keeperOfRecord`; the copier donates
+  gas — no priority-gas auction forms over the tip). DOES NOT fund/verify
+  monitoring (the tip pays for *landing a tx*; monitoring is priced + policed by
+  the off-chain SLA), force promptness, stop swap sandwiches (a searcher can
+  self-trigger the public bearer payload — the `OracleSwapAdapter` floor is the
+  defense), or provide an in-protocol dead-keeper backstop when `keeperOfRecord
+  != 0` (recovery = untipped permissionless execution / cancel-and-resign).
+- **R1.5 class defaults (compiler policy):** stop-loss/liquidation-protection →
+  `keeperOfRecord = 0` (open bounty; any-fast-someone maximizes liveness) +
+  buffer-over-speed trigger; recurring DCA → Keep v1's baked-recipient transfer
+  stays primary; the compiler MUST surface `keeperOfRecord` as an explicit
+  choice against a published keeper directory (self / Keep service / third party
+  / none), NEVER a silent house default, and MUST NOT price-discriminate on it
+  (anti-incumbency).
+- **R1.7 non-goals:** no exclusivity windows, no commit-reveal (the payload is a
+  public bearer instrument from run 1 — nothing is secret), no on-chain tip
+  auction, no escalation/ramp fields, no bonding in the processor, no tip on the
+  pause path.
+- **Audit surface:** three struct fields, one ternary, one gas-capped external
+  call after all state updates inside `nonReentrant`, **zero** new storage
+  mappings, zero execution-state reads in the payout path.
+
+*Why the window died:* the "exclusive-then-open" variant protected
+cooldown-paced runs (which a cron can fire — they need no monitoring) and
+abandoned gate-flip-timed runs (the only ones that do), invited
+`openAfter`-squatting + straddle-pacing by the keeper, and had a CEI-ordering
+footgun. Unconditional signed-payee routing keeps the one property that held
+(snipe-dominance, at every instant) and deletes every exploit hanging off the
+windows. Monitoring quality is a lemons market that only a provable-fault SLA
+(gate provably true at block B via Chainlink round data, no execution within N
+blocks, no third-party execution to excuse it) can police — not a tip.
 
 **RIDER 2 — ERC-1271 smart-account initiators.** If `initiator` has code,
 verify via `IERC1271.isValidSignature(hash, sig)` instead of `ecrecover` — one
@@ -205,6 +283,12 @@ have participants; a trust artifact for a trust-is-the-product service.
 - Session keys / policy modules (Design C), k-of-N runtime quorum, generic
   call-anything adapter — rejected in the base ADR / roadmap; unchanged.
 
-_Source: multi-agent opportunity-research + adversarial-critique workflow,
-2026-07-17 (6 opportunity spaces × novelty/feasibility/value critique panel),
-grounded in the deployed surface and ROADMAP v1 commitments._
+_Sources: multi-agent opportunity-research + adversarial-critique workflow,
+2026-07-17 (6 opportunity spaces × novelty/feasibility/value critique panel);
+RIDER 1 + corrections C1/C2 revised by the CoW/MEV mechanism-design workflow,
+2026-07-18 (threat model → CoW/MEV/keeper-game-theory research → design →
+game-theory/implementability/complexity critique panel). Verdict on "CoW for
+everything": PARTIAL — reject batch auctions / coincidence-of-wants / uniform
+clearing (single-user intents have no counterparty flow; firing is
+same-direction gate-correlated). Keep only the signed-payee routing principle
+(RIDER 1) and execution-time oracle pricing (OracleSwapAdapter, ROADMAP NEXT)._
