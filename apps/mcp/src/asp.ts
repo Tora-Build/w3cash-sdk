@@ -11,6 +11,8 @@
  * sent. Base URL is configurable via ASP_BASE_URL for local/staging targets.
  */
 
+import { payingFetch } from "./payer.js";
+
 /** Base URL of the ASP, trailing slashes trimmed. Overridable via env. */
 export const ASP_BASE_URL: string = (
   process.env.ASP_BASE_URL ?? "https://asp.w3.cash"
@@ -57,7 +59,7 @@ async function request(
 
   let res: Response;
   try {
-    res = await fetch(url, {
+    res = await payingFetch(url, {
       method,
       headers:
         body === undefined
