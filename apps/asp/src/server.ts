@@ -267,7 +267,57 @@ const compileHandler: RequestHandler = async (req: Request, res: Response) => {
   }
 };
 
+// GET handler for /compile-intent. x402 clients probe/replay a paid resource with
+// GET (only reached AFTER payment — the x402 middleware 402s unpaid GETs), and the
+// OKX marketplace validator drives exactly that flow. Without a GET handler a paid
+// probe hits the 404 fallback and the agent looks unresponsive. So return a valid
+// result: if a `goal`/`chain` is passed as a query param it compiles that; else a
+// runnable X Layer sample. Real integrations POST {chain, conditions, actions}.
+const SAMPLE_REQUEST: CompileRequest = {
+  chain: 1952,
+  initiator: "0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3",
+  conditions: [
+    {
+      type: "balance",
+      token: "0x9e29b3aada05bf2d2c827af80bd28dc0b9b4fb0c",
+      target: "0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3",
+      operator: "gte",
+      threshold: "1000000",
+    },
+  ],
+  actions: [
+    {
+      type: "transfer",
+      token: "0x9e29b3aada05bf2d2c827af80bd28dc0b9b4fb0c",
+      to: "0xEfdB15EE6e7C7C7906cb230AfF1EDb75CcBaA74F",
+      amount: "100000",
+    },
+  ],
+};
+const getCompileHandler: RequestHandler = (req: Request, res: Response) => {
+  try {
+    const chain =
+      typeof req.query.chain === "string" ? req.query.chain : undefined;
+    const request: CompileRequest = chain
+      ? { ...SAMPLE_REQUEST, chain }
+      : SAMPLE_REQUEST;
+    const intent = compileIntent(request);
+    res.status(200).json({
+      ok: true,
+      note: "Sample compiled intent. POST {chain, conditions, actions} to /compile-intent for a custom one; see GET /capabilities and /recipes.",
+      intent,
+    });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
+};
+
 // Payment gating (when enabled) is applied globally above via buildX402Middleware.
+app.get("/compile-intent", getCompileHandler);
 app.post("/compile-intent", compileHandler);
 
 // 404 JSON fallback so unknown routes return the {ok:false,...} envelope rather
