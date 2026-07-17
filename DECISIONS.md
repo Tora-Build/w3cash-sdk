@@ -108,3 +108,103 @@ function incrementEpoch() external { epoch[msg.sender] += 1; }             // re
 - Close paused-path event spam on-chain (`lastSeen` SSTORE) or accept + handle at the indexer?
 
 _Source: multi-agent research + adversarial-review workflow, 2026-07-16 (AA/ERC-4337 nonces, ERC-7579 session keys, Seaport/0x/Permit2 order-hash + bitmap nonces, Gnosis Safe + EIP-712 domain separation, recurring-execution systems)._
+
+---
+
+## ADR-0001 — Addendum A: redeploy riders & batch scope
+
+- **Status:** Accepted (design) — locks the feature set that rides the ADR-0001 redeploy. Must be folded into the contract spec **before** audit freeze.
+- **Date:** 2026-07-17
+
+### Why an addendum
+
+The processor is immutable: the audited hardening redeploy is the **only**
+window to add processor-level features without a second migration cycle. This
+addendum enumerates exactly what rides that redeploy (the "riders"), what is
+deliberately excluded, the hidden costs now booked, and resolutions to the open
+questions from the base ADR. Anything processor-level not on this list waits an
+entire redeploy cycle — err on the side of speccing now, cutting at audit.
+
+### Riders (in the frozen spec)
+
+**RIDER 1 — Keeper tip.** Two fields in the signed EIP-712 header the base ADR
+already redefines: `{ tipToken: address, tipAmount: uint128 }`. On the
+non-pause path the processor pulls the tip from the initiator and pays
+`msg.sender`, inside the reserve-then-run CEI block under `nonReentrant`.
+Turns execution into an open, permissionless bounty marketplace (and retires
+the interim appended-transfer keeper fee from Keep Service v1).
+*Design question to resolve in the spec:* open bounties invite fire-block
+tip-sniping that expropriates whoever paid for months of monitoring — weigh a
+short priority window or commit-reveal; monitoring itself is priced separately
+via the watch tier regardless.
+
+**RIDER 2 — ERC-1271 smart-account initiators.** If `initiator` has code,
+verify via `IERC1271.isValidSignature(hash, sig)` instead of `ecrecover` — one
+fallback branch in the verification code the base ADR already rewrites for
+EIP-712, plus compiler emission of the 712 struct a Safe UI can sign. Admits
+Safe / Kernel / Nexus / DAO treasuries, which are entirely locked out today.
+Explicitly **not** the rejected Design C (session keys / policy modules) —
+policies stay in the user's own account.
+
+**RIDER 3 — Intent-dependency getters.** Public single-word views
+`executionsOf(bytes32 digest) → uint256` (and `lastExecutedOf`) unpacking the
+packed `IntentState`, so `afterIntent` conditions compile to the
+already-deployed QueryAdapter targeting the processor itself — "intent B only
+after intent A ran n times" (sequencing, ordered workflows). Document that
+"A executed" means the whole payload ran (execute is all-or-nothing).
+
+**RIDER 4 — CREATE2 uniform-address deployment kit.** Deterministic-factory
+deploys of the post-audit processor, registry, and portable adapters with fixed
+salts, so every chain shares one canonical address set and chain N+1 becomes a
+config one-liner. **Hard prerequisite: the base ADR's EIP-712 domain
+separation** — uniform addresses under today's EIP-191 scheme would be a
+cross-chain replay *amplifier*. DeFi adapters with chain-specific constructor
+args stay per-chain.
+
+**RIDER 5 — Processor-native Permit2 funding.** Per-intent funding via
+witness-bound Permit2 `SignatureTransfer` in the CEI block: one canonical
+Permit2 approval forever, zero standing per-adapter allowances (eliminating the
+standing-approval drain class entirely), and the RIDER-1 tip pull rides the
+same path. Moderate audit surface — the strongest security-posture upgrade per
+contract line. The NEXT-tier Permit2 *adapter* (see ROADMAP v2) proves the flow
+pre-audit and graduates into this.
+
+### Booked costs (not riders — consequences)
+
+**Adapter-fleet migration.** Every adapter pins the processor address as an
+immutable constructor arg, so the redeploy forces redeploying **all** adapters
+on **all** chains and re-collecting user approvals. Sequencing rule: NEXT-tier
+adapter deploys land as close to the redeploy as possible to avoid double
+deployment; the constrained BatchAdapter's second-authorized-caller change
+rides this same fleet redeploy (the only time it is cheap).
+
+**Public golden-vector conformance kit.** Publish the encode/digest test
+vectors (per chain — 84532 and 1952+ produce distinct digests; that *is* the
+domain-separation property under test) so third-party keepers and integrators
+can independently verify payloads. Required for the RIDER-1 marketplace to
+have participants; a trust artifact for a trust-is-the-product service.
+
+### Open questions from the base ADR — resolved
+
+- **On-chain minimum cooldown floor:** yes — a small constant floor for any
+  reusable intent (`maxRuns != 1`), keeping high-frequency DCA possible while
+  preventing same-block loops; the ASP may impose stricter per-recipe floors.
+- **Paused-path event-spam:** handle at the indexer, **no** `lastSeen` SSTORE
+  on the pause path — funds are safe, the attacker pays gas, and the pause path
+  must stay write-free to preserve the resume property.
+
+### Explicitly NOT riding the redeploy
+
+- OR/any-of gate composition — ships earlier as `CompositeGateAdapter`, no
+  processor change (bracket/OCO *marketing* still gates on the redeploy, since
+  pre-ADR a fired leg can re-fire).
+- WordLens, Pyth gate, ERC-4626 vault, dynamic verbs, Borrow/Repay — all
+  processor-free by design (see ROADMAP v2, NEXT tier).
+- The scoped Base-mainnet beachhead — deliberately pre-ADR with capped verbs,
+  bounded allowances, mandatory expiry, and distinct (non-CREATE2) addresses.
+- Session keys / policy modules (Design C), k-of-N runtime quorum, generic
+  call-anything adapter — rejected in the base ADR / roadmap; unchanged.
+
+_Source: multi-agent opportunity-research + adversarial-critique workflow,
+2026-07-17 (6 opportunity spaces × novelty/feasibility/value critique panel),
+grounded in the deployed surface and ROADMAP v1 commitments._
