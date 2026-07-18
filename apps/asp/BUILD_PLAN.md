@@ -23,14 +23,36 @@ destinations. Build them thin.
 
 ## Track A — Audit (parallel, starts now)
 
-The spec is frozen in ADR-0001 + Addendum A (5 riders, corrections C1/C2). Steps:
-1. Select auditor; scope = the ADR-0001 processor + the riders + the C1/C2
-   fixes + the fleet-migration surface.
-2. Freeze the open items Addendum A flags before the engagement: keeper-tip
-   gas-cap value (~150k) validated against non-standard/FoT tokens; the
-   cross-chain envelope encoding (C2); the on-chain cooldown floor constant.
-3. Audit runs while Phases 1–2 build. **Redeploy is gated on: audit clean AND
-   Phase 2 shipped.**
+The spec is ADR-0001 (**Design C** as of 2026-07-18) + Addendum A (5 riders,
+corrections C1/C2) + Addendum B (core surgery) + **Addendum C (the frozen
+pre-audit fix list, 11 amendments)**. Steps:
+0. ~~Adversarially harden the Design C spec first.~~ **DONE 2026-07-18** — 5-angle
+   research → hardened design → 5-lens critique panel (12 agents). Verdict:
+   **proceed to audit after amendments 1–11 — not a rethink**; the auth core
+   survived all lenses. Fix list is Addendum C. Two items MUST land before freeze
+   (op-kind classification; native pause-path refund) + one critical adapter hole
+   (FlashLoanAdapter). The two mandated pre-freeze items are now **DECIDED**
+   (Addendum C Resolutions 1–2): flash-frame isolation = source-keyed exemption +
+   transient nesting-counter frame (carries a formal-proof audit deliverable); cap =
+   unified rolling-window with `resetPeriod==0` = absolute lifetime cap.
+1. Select auditor; scope = the ADR-0001 **Design C** processor (session layer +
+   substrate cursor) + the riders + C1/C2 + Addendum B core surgery + **Addendum C
+   amendments** + the fleet-migration surface. Design C ~doubles the core surface
+   vs. Design A — budget accordingly.
+2. Freeze the remaining open items before the engagement: the typed `Policy` struct
+   + length caps + op-kind (GATE/ACTION) discriminator; keeper-tip gas-cap (~150k)
+   vs. FoT tokens; the C2 cross-chain envelope; the cooldown floor (which also floors
+   `resetPeriod`). *(The cap-shape and flash-frame-isolation decisions are now closed
+   — Addendum C Resolutions 1–2; only the flash-frame formal proof remains.)*
+3. Audit runs while Phases 1–2 build. **Redeploy is gated on: Addendum C applied +
+   the flash-frame proof closed AND audit clean AND Phase 2 shipped.**
+
+**New booked costs surfaced by the hardening pass (Addendum C):** the adapter
+fleet must be **rewritten for SOLE-MOVER** (processor-fed via balance-threading,
+no adapter-side `transferFrom(root)`) and **codehash-pinned** into session
+allowlists; the shipped **FlashLoanAdapter** (live arbitrary-call + full-principal
+root repay) is **excluded until rewritten**. These fold into the same fleet
+redeploy — but they are now required, not optional.
 
 ## Phase 1 — NOW (no contract changes; Base Sepolia + off-chain)
 
@@ -79,14 +101,31 @@ Strict-tier first block; ships on the current deployment.
 ## Phase 3 — Redeploy (after Track A audit clean + Phase 2 shipped)
 
 The one immutable redeploy carrying every processor-level change:
-- **Base-ADR core** + **corrections C1** (bind full header, `seq==0` always, no
-  resume storage) **+ C2** (execution-chain domain + cross-chain envelopes).
-- **RIDER 1** signed-payee tip · **RIDER 2** ERC-1271 · **RIDER 3**
-  `executionsOf()` · **RIDER 4** CREATE2 · **RIDER 5** native Permit2 funding.
+- **Base-ADR core = Design C** (changed 2026-07-18): the Design-A per-intent cursor
+  **plus** the session-key authorization layer — root-signed `SessionGrant`,
+  session-key-signed intents, typed `Policy` (target allowlist + verb mask +
+  per-token caps), per-token `spentByToken` reserve-then-run, three-tier revocation
+  (expiry / `revokeSession` / `incrementEpoch`). This is the biggest freeze item.
+- **Corrections C1** (bind full header, `seq==0` always, no resume storage) **+ C2**
+  (execution-chain domain + cross-chain envelopes) — apply to both digests.
+- **RIDER 1** signed-payee tip · **RIDER 2** ERC-1271 **root** grantor · **RIDER 3**
+  `executionsOf()` · **RIDER 4** CREATE2 · **RIDER 5** native Permit2 funding
+  (feeds the spend-cap `cost`).
+- **Addendum B** core surgery: multi-mode funding descriptor (composes with the
+  spend cap), controlled-callback flash frame (isolation from the cap must be
+  proven), op-encoding compaction, `IAdapter` split, `msg.value` conservation.
 - **Fleet migration** (all adapters re-deploy, caller-pinned) + **public
-  golden-vector conformance kit**.
+  golden-vector conformance kit** (now incl. grant digests + policy/spend negative
+  vectors).
 - Post-redeploy: promote full DeFi verbs to mainnet; graduate recurring
   `OracleSwapAdapter`, the RIDER-1 tip, and the keeper marketplace.
+
+**Design C raises the audit surface ~2× vs. Design A** (grant verification + typed
+policy decoder + per-token spend accounting + two-signature path). The
+`_policyAllows` decoder and the per-token spend reserve are the two highest-risk
+freeze items — see ADR-0001 Residual risks. **The Design C spec is a first-draft;
+it must be adversarially hardened (research + critique workflow) before audit
+freeze** — Track A's scope expands accordingly.
 
 ## Later / bets
 AMB remote dispatch · Sooth trading actions (needs `onBehalfOf`) · OKX DEX
@@ -161,10 +200,18 @@ that needs to be in the core — batched:
 - **Fix the security holes** (from ADR-0001 + the CoW/MEV research): stop
   signatures being replayable (per-intent counter), stop a manipulated header
   from skipping the conditions, and bind each signature to its exact chain.
+- **Session keys + spend caps (Design C — the authorization core, chosen
+  2026-07-18).** Instead of the owner signing every intent, the owner grants a
+  **bounded, expiring, revocable session** to a hot agent key — capped per token,
+  scoped to specific actions, cancellable three ways (let it expire / revoke this
+  one key / revoke everything). This is what lets an AI agent operate on your
+  behalf autonomously without ever holding your main key, and a leaked agent key
+  can drain at most its remaining budget. It roughly doubles the audit surface, so
+  it must be hardened by the research+critique workflow before the audit freeze.
 - **Keeper tips** — pay whoever executes an intent a small tip that routes to the
   right keeper even if someone copies the transaction.
-- **Support smart-account wallets** (Safe, AA wallets) as signers, not just plain
-  keys.
+- **Support smart-account wallets** (Safe, AA wallets) as the session **grantor**,
+  not just plain keys.
 - **Get funding right, permanently** — because how the contract pulls the user's
   money is frozen into every signature, we bake in all three ways up front:
   one-shot pulls (Permit2), recurring pulls (for scheduled intents), and

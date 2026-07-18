@@ -6,15 +6,21 @@ endpoint (`/mcp`, 4 tools + the usage skill served as the `w3cash://skill`
 resource, client-side x402 payer built in), multi-chain compiler (Base Sepolia
 84532 full action set; X Layer testnet 1952 minimal core), keyless signing via
 the OnchainOS Agentic Wallet proven end-to-end on-chain. `DECISIONS.md`
-ADR-0001 fixes the replay/nonce architecture in one audited, immutable redeploy.
+ADR-0001 (**Design C**, chosen 2026-07-18) fixes replay **and** delivers the
+authorization end-state — root-granted, spend-capped, revocable **session keys**
+for delegated agent signing — in one audited, immutable redeploy.
 
 **The arc:** W3Cash becomes the safe-by-default **lifecycle owner** of a
 non-custodial intent — compile → free-simulate → watch → notify → execute →
 verify — funded by two streams: (a) per-call compile fees via x402, and (b) a
 keep-and-execute keeper service billed per execution. The pre-audit period is
 spent on the two things that actually gate demand: **safety** (pre-ADR
-signatures are replayable; one drained agent ends the product) and **real
-money** (a deliberately capped mainnet beachhead).
+signatures are replayable; one drained agent ends the product — the Design C
+session key with a per-token spend cap is the permanent answer) and **real
+money** (a deliberately capped mainnet beachhead). The off-chain safe-default
+work below is the pre-ADR precursor to Design C: today's auto-expiry becomes the
+**session expiry**, and today's exact-sized allowance + exposure line becomes the
+**per-token spend cap**.
 
 Everything below is sequenced by what it needs: nothing → new adapters → the one
 ADR-0001 contract redeploy (which, because the processor is immutable, must
@@ -178,14 +184,23 @@ off-chain-data conditions via a zkTLS/kpi-resolver-style relayer.)*
 ## WITH THE ADR-0001 REDEPLOY — contract-batched
 
 The processor is immutable, so the audited hardening redeploy is the **one
-shot** to add processor-level features. The full rider list, sequencing rules,
-fleet-migration plan and conformance kit are specified in `DECISIONS.md`
-ADR-0001 **Addendum A** — summary:
+shot** to add processor-level features. The full spec, sequencing rules,
+fleet-migration plan and conformance kit are in `DECISIONS.md` ADR-0001
+(base + Addenda A/B/**C**; Addendum C is the frozen pre-audit fix list from the
+2026-07-18 adversarial-hardening pass — verdict: proceed to audit after its 11
+amendments) — summary:
 
-1. **RIDER 1 — keeper tip** `{tipToken, tipAmount}` paid to `msg.sender` →
-   open execution-bounty marketplace (retires the appended-transfer fee).
-2. **RIDER 2 — ERC-1271** smart-account initiators → Safe / Kernel / Nexus /
-   DAO treasuries become addressable customers.
+0. **BASE — Design C authorization core** (chosen 2026-07-18): the per-intent
+   EIP-712 cursor **plus** root-granted, spend-capped, revocable **session keys**
+   + a typed **policy** module. This is what makes an AI agent a first-class
+   signer — the owner grants a bounded session once, the agent signs many intents
+   inside a per-token budget, and a leaked agent key drains at most its remaining
+   cap. Biggest freeze item; ~2× the audit surface of Design A; **first-draft
+   spec — harden via the research+critique workflow before audit freeze.**
+1. **RIDER 1 — keeper tip** `{tipToken, tipAmount, keeperOfRecord}` signed-payee
+   routing → open execution-bounty marketplace (retires the appended-transfer fee).
+2. **RIDER 2 — ERC-1271** smart-account **session grantors** → Safe / Kernel /
+   Nexus / DAO treasuries can grant agent sessions.
 3. **RIDER 3 — `executionsOf()` getters** → `afterIntent` dependency gates via
    the existing QueryAdapter ("B only after A ran n times").
 4. **RIDER 4 — CREATE2 uniform addresses** (safe only *after* domain
