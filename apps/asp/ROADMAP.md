@@ -103,14 +103,16 @@ signed amount/deadline-scoped permit. The stack already runs Permit2 (the MCP
 x402 payer). This is the bridge to RIDER 5, which bakes the same mechanism into
 the processor at the redeploy.
 
-### 3. WordLens — universal multi-return view unlock *(~40 lines, outsized win)*
-A tiny stateless view contract (`extractWord`, `chainlinkAgeSeconds`,
-`chainlinkAnswerFresh`, `healthFactor`, …) staticcalled by the **existing**
-query condition — not an IAdapter, no registry entry. Restores the dropped
-Chainlink staleness check and unlocks every multi-return getter (Aave health
-factor, EAS attestations, `Governor.state`, ERC-4626 share price) as compile-fee
-recipes. Codifies the "gates pause, never revert" standard: the lens returns
-sentinel words instead of propagating inner reverts.
+### 3. `OracleReadAdapter` — typed multi-return reader *(supersedes "WordLens"; fixes a real bug)*
+A stateless helper read by the **existing** query condition — not an IAdapter, no
+registry entry. **Fixes a current defect:** `QueryAdapter` does
+`abi.decode(result,(uint256))`, so against a Chainlink feed it reads
+`latestRoundData()`'s first word = `roundId`, **not** the price. The typed reader
+handles Chainlink/Pyth/RedStone/API3/ERC-4626 (price + staleness, Aave health
+factor, EAS attestations, `Governor.state`, 4626 share price) as compile-fee
+recipes, returning sentinel words on failure (never propagating inner reverts).
+See ADR-0001 Addendum B (standalone contracts). *(The earlier "WordLens" generic
+`extractWord` framing is folded into this typed reader.)*
 
 ### 4. ERC-4626 VaultAdapter *(consolidates v1's per-protocol adapter list)*
 `vaultDeposit` / `vaultWithdraw` / `vaultRedeemAll` with `receiver=initiator`

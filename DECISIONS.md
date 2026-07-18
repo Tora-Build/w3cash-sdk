@@ -292,3 +292,125 @@ everything": PARTIAL — reject batch auctions / coincidence-of-wants / uniform
 clearing (single-user intents have no counterparty flow; firing is
 same-direction gate-correlated). Keep only the signed-payee routing principle
 (RIDER 1) and execution-time oracle pricing (OracleSwapAdapter, ROADMAP NEXT)._
+
+---
+
+## ADR-0001 — Addendum B: contract-architecture scope for the redeploy
+
+- **Status:** Accepted (design) — extends the ADR-0001 redeploy freeze list beyond
+  the 5 riders. Fold into the audit scope before freeze.
+- **Date:** 2026-07-18
+- **Verdict:** **Keep the shape, do surgical (not sweeping) core surgery.** The
+  processor + per-adapter + user-signs-the-EXACT-target envelope is the right
+  foundation (Seaport-zone posture). The immutable redeploy is a once-ever chance,
+  so it must carry every processor-level change — but only the ones that are
+  *unfixable if omitted*. Everything else ships later as a redeployable adapter.
+
+### KEEP (the current minimalism is right)
+
+- **Immutability + non-custodial + permissionless `execute()`** — the "no admin
+  can change the rules" pitch *is* the product; every change here is admin-free.
+- **User signs the EXACT target** on the local path — a deliberate divergence from
+  outcome-declarative intent standards, not legacy drift. Re-encoding to a
+  7683/7521 solver-fill envelope is a **category error**: a solver structurally
+  cannot fill a local W3Cash intent (no counterparty), and it would import the
+  counterparty risk our value prop removes.
+- **Per-adapter contracts as the evolvability story** — a new capability = deploy
+  a new immutable adapter, usable the instant the SDK knows its address. Zero
+  processor change. Formalize this as official.
+- **PAUSE-sentinel gates + whole-intent atomicity-on-revert** — a hard revert
+  already unwinds the whole intent, so **no all-or-nothing wrapper is needed**.
+- **The `OnlyProcessor` caller-pin — KEPT (reversal of an earlier draft).** It is
+  a free, universal, one-line boundary guard on an unpatchable contract. Dropping
+  it to "avoid the fleet-migration tax" is a false economy (that tax is paid once
+  this redeploy regardless) and would trade enforceable defense-in-depth for an
+  unenforceable "every future adapter must stay perfectly stateless" discipline.
+
+### ADD to the redeploy (unfixable-if-omitted core primitives)
+
+1. **Multi-mode funding descriptor** (frozen into the interpreter, one per op):
+   (a) **Permit2 SignatureTransfer** witness-bound pull — one-shot, exact amount;
+   (b) **standing authorization** (AllowanceTransfer or approve-to-processor),
+   per-run cap gated by the ADR-0001 cursor — because single-use nonces *cannot*
+   fund keyless `maxRuns>1` recurring intents; (c) **contract-held-balance
+   ("balance-threading")** — an op funds from the processor's transiently-held
+   balance of a token, which is how chained dynamic-amount flows, cross-chain
+   inbound legs, *and* flash-loan sub-groups all get funded. The processor is the
+   **sole** Permit2 caller. *(Rejected: Permit2 as the SOLE path — it can't fund
+   recurring or dynamic ops and buys no free upgrades, since `spender=processor`
+   is baked into every signature.)* Frozen into every signature → get it wrong and
+   you need a **second** core redeploy.
+2. **Controlled-callback reentrancy frame** (the top previously-missed primitive).
+   Instead of a blanket `nonReentrant`, a **known-entrypoint** guard that admits
+   exactly ONE bounded flash-loan callback sub-group (funded by balance-threading)
+   and blocks uncontrolled re-entry everywhere else. Omitting it forecloses the
+   entire **leverage / collateral-migration / debt-refinance** surface *forever*
+   (the guard + loop shape are frozen). Highest audit-risk item in the freeze —
+   its "admits only the designated sub-group" property must be proven on every
+   exit path.
+
+### SUBTRACT from the redeploy (all critiques agree — dead surface off an immutable contract)
+
+- Delete the **dormant cross-chain AMB branch** (`_sendCrossChainMessage`,
+  inline-asm `_updateHeader`, the `getChain` routing test, `getAdapter(amb).send`)
+  → processor becomes a **pure local interpreter**. 2026 cross-chain is
+  solver-settlement (see below), not the lock-and-message branch.
+- Delete `AdapterRegistry`'s local-path role + the dead `authorizedEndpoints` /
+  `setAuthorizedEndpoint` admin state. The processor takes **no** per-chain
+  constructor immutables (preserves RIDER-4 uniform addresses); any chain table
+  is a pure external `ChainRegistry`, never folded into processor immutables.
+- **Compact op encoding**: replace the 6-field tuple (`chain,amb,fee,target,
+  selector,value` — `amb/fee/chain` dead locally, `selector` decoded-then-
+  discarded) with `(target, value, fundingMode, fundingParams, flags)` and a
+  **generously-provisioned variable-length** funding/flags field — NOT crammed
+  into the dead `bytes8`.
+- **Split `IAdapter`** into `IActionAdapter` / `IGateAdapter` / `IBridgeAdapter`
+  (or ERC-165 probing); only `IBridgeAdapter` carries `send/estimateFee`.
+  `IActionAdapter` declares its funding mode + the first-word-return convention
+  balance-threading relies on.
+- **`msg.value` conservation**: assert `sum(op.value)+fees == msg.value` and
+  sweep residual/dust to the initiator on exit — no permanently locked ETH.
+
+### DEFER (ships later as redeployable adapters — do NOT burn freeze bandwidth)
+
+- The general **Weiroll-style register VM** — highest permanent audit cost; the
+  dominant "swap then deposit the ACTUAL output" case is covered by
+  balance-threading + purpose-built dynamic adapters.
+- **OPTIONAL / try-catch control flow** — best-effort multi-venue is a
+  redeployable `MultiRouteSwapAdapter`; swallowing reverts around fund movement
+  is a loss/griefing bug class.
+- **x402 escrow/receipt schema** — redeployable periphery, unproven schema,
+  reintroduces custody. Ship as a `ReceiptAdapter`/`EscrowAdapter` later.
+
+### New standalone contracts (ship ANYTIME — the processor need not know them)
+
+| Contract | Purpose | Value |
+|---|---|---|
+| **`PostConditionAdapter`** | A delta-assertion gate placed AFTER action ops whose unmet behavior is **REVERT** (not pause) — snapshot before, check after; the on-chain slippage/MEV safety net. | 9 |
+| **`OracleReadAdapter`** (typed) | **Fixes a real current bug:** `QueryAdapter` does `abi.decode(result,(uint256))`, which reads `latestRoundData()`'s first word = `roundId`, **not** the price. A typed reader for Chainlink/Pyth/RedStone/API3/ERC-4626. Supersedes the roadmap's "WordLens." | 8 |
+| **`ERC7683BridgeAdapter`** | Canonical cross-chain outbound leg: opens an ERC-7683 `CrossChainOrder` to Across/solvers, funded via balance-threading. | 8 |
+| **`W3CashResolver`** | Stateless `resolve(signedPayload) → (tokensSpent[], gates[], recipient, deadline)` — simulation/preview, 7683-field-shaped. | 8 |
+| **`W3CashReceiver`** (per-chain) | Cross-chain ACTIONS inbound: `handleV3AcrossMessage`/`ccipReceive`, holds bridged funds transiently, forwards the C2-signed destination envelope. | 7 |
+| **`FlashLoanAdapter`** shells | Pool-specific (Aave/Balancer/Morpho) shells that drive the in-core controlled-callback frame. | 7 |
+| **`KeeperCoordinator`** | Stake/rotate/reputation/slash for the keeper economy — kept OUTSIDE the core; users sign `keeperOfRecord = coordinator` (RIDER-1 seam). | 5 |
+
+### Open questions for the audit / freeze
+
+- Recurring funding: standing AllowanceTransfer vs direct approve-to-processor
+  vs per-run fresh SignatureTransfer.
+- The controlled-callback guard must be **proven** to admit only the designated
+  flash sub-group on every path (revert/pause/normal).
+- Balance-threading isolation: no cross-intent balance-confusion (one intent's
+  residual funding another's op).
+- Op-encoding **headroom**: reserve enough in the funding/flags field that a
+  future funding mode (e.g. ERC-4626 share-based) fits without a second redeploy.
+- If **EIP-1153 transient storage** backs balance accounting, **zero every slot
+  on every exit path** (SIR.trading lost $355k to an unzeroed `TSTORE`).
+- Migration honesty (product-side): outstanding recurring intents run out their
+  life on v1 (spender + verifyingContract binding); new intents sign against v2.
+
+_Source: multi-agent contract-architecture workflow, 2026-07-18 (5 topics:
+intent standards / execution model / missing primitives / upgradeability /
+cross-chain → synthesis → over-engineering-trust / migration-immutability /
+feasibility-completeness critique panel; the final revision reversed two of its
+own draft's core moves — dropping the caller-pin and Permit2-as-sole-path)._

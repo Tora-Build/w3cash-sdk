@@ -96,3 +96,90 @@ fleet redeploy) · HyperEVM core · proof-of-keep SLA receipts.
 _Sequencing rule: anything deployed pre-redeploy is caller-pinned and redeploys
 with the fleet — land Phase-2 adapter deploys as close to the redeploy as the
 strict-tier order allows to avoid double work._
+
+---
+
+## The changes in plain terms — OFF-CHAIN vs ON-CHAIN
+
+Two kinds of work. **Off-chain** = the compiler/API/keeper — safe, reversible,
+ships continuously, never touches the deployed contracts. **On-chain** = smart
+contracts — either *new standalone contracts* (deploy to new addresses anytime,
+old ones untouched, submission unaffected) or *the one immutable processor
+redeploy* (the big, audited, once-ever event).
+
+### Off-chain changes (the compiler, API, and keeper — no contracts)
+
+- **Make every intent safe by default.** When an agent compiles a goal, we
+  automatically add a sensible **expiry** (short for one-shot, long for
+  scheduled), size the token approval to the **exact** amount needed, and print
+  the worst-case exposure — so a leaked signature can't be replayed forever.
+  Plus a one-tap "cancel everything" button. *(Phase 1)*
+- **Free "will this work?" preview.** A new tool that dry-runs the intent and
+  says "yes it would fire / no, this gate is blocking, by this much / you need
+  this approval first" — before anyone signs or pays. It's free; it's the hook
+  that leads to the paid compile. *(Phase 1)*
+- **Memory + dashboards.** Today an agent forgets its intents between sessions.
+  We add "show me all my active/pending intents and how to cancel them," plus
+  public reliability stats (how often our recipes actually fire) — which is how
+  other agents will decide to trust us. Runs on Cloudflare Workers. *(Phase 1)*
+- **Pricing tiers.** Free preview → pay-per-compile → keeper subscription. *(P1)*
+- **The keeper service.** A watcher that checks each waiting intent every few
+  seconds and submits it the moment its condition becomes true — so users don't
+  have to babysit. It bills a small per-execution fee. *(Phase 2)*
+- **Smarter compiling.** Warn on implausible thresholds, auto-fill swap slippage,
+  split our "how to use it" guide into per-use-case skills. *(Phase 1)*
+
+### On-chain — NEW standalone contracts (deploy anytime, submission unaffected)
+
+Each is a small independent contract at a **new address**; the compiler just
+learns the address. Nothing about the current deployment or the OKX listing
+changes.
+
+- **`OracleReadAdapter`** — *fixes a real bug*: our current price-condition can't
+  actually read a Chainlink feed correctly (it reads the wrong field). This typed
+  reader does, and unlocks price-staleness, Aave health-factor, and vault-price
+  conditions. **Highest priority — it's a correctness fix.** *(Phase 2)*
+- **`PostConditionAdapter`** — an on-chain "did I actually get what I expected?"
+  check placed after an action that **reverts** if not (slippage/MEV safety net).
+- **`OracleSwapAdapter`** — re-prices a swap's minimum-out at execution time from
+  a live oracle, so a swap signed weeks ago can't be sandwiched. *(Phase 2)*
+- **New action adapters** — ERC-4626 vaults (one contract = every vault),
+  dynamic amounts ("send 50% of my balance"), Aave borrow/repay (already written,
+  just deploy), payment-with-receipt, and a Sooth market settlement crank.
+- **`W3CashResolver`** — a read-only "simulate this intent" contract other tools
+  can call.
+- Later: cross-chain bridge/receiver adapters, a `KeeperCoordinator` (staking/
+  reputation for keepers), flash-loan shells.
+
+### On-chain — the ONE immutable processor redeploy (audited, once-ever)
+
+This is the only heavy, irreversible on-chain event. It happens **once**, after
+an audit, to a new address, and old intents keep running on the old contract.
+Because the processor can never be changed after, it must carry **everything**
+that needs to be in the core — batched:
+
+- **Fix the security holes** (from ADR-0001 + the CoW/MEV research): stop
+  signatures being replayable (per-intent counter), stop a manipulated header
+  from skipping the conditions, and bind each signature to its exact chain.
+- **Keeper tips** — pay whoever executes an intent a small tip that routes to the
+  right keeper even if someone copies the transaction.
+- **Support smart-account wallets** (Safe, AA wallets) as signers, not just plain
+  keys.
+- **Get funding right, permanently** — because how the contract pulls the user's
+  money is frozen into every signature, we bake in all three ways up front:
+  one-shot pulls (Permit2), recurring pulls (for scheduled intents), and
+  "use the money the previous step produced" (which also enables **flash loans /
+  leverage** — a whole product category that's impossible to add later).
+- **Trim the fat** — delete unused/dead code paths, tidy the data format, so the
+  permanent contract is as small and auditable as possible.
+
+**Simple mental model:** off-chain and new adapters are *lego bricks* we add
+freely; the processor redeploy is *pouring the foundation* — we only get to pour
+it once, so we pour everything structural in at the same time, after inspection.
+
+### What is NOT affected, ever
+
+The submitted OKX demo, the live `asp.w3.cash` service, and the current
+contracts stay exactly as they are until *we* choose to point the compiler at new
+addresses — which is a deliberate, separate step, not a side effect of any of the
+above.
