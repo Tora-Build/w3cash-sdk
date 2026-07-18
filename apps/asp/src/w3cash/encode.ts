@@ -271,10 +271,29 @@ export const XLAYER_CONFIG: ChainConfig = {
   adapters: XLAYER_ADAPTERS,
 };
 
+export const XLAYER_MAINNET_CHAIN_ID = 196 as const;
+
+/**
+ * X Layer MAINNET (196) — same minimal core as testnet, deployed to the SAME
+ * addresses (deterministic nonce-0 deploy by the same deployer 0xEfdB…). The
+ * registry's local mapping is set on-chain (`setChain(0, 196)`, getChain(0)==196)
+ * so local ops route correctly. USD₮0 here is 0x779Ded… (also the x402 mainnet
+ * settlement asset).
+ */
+export const XLAYER_MAINNET_CONFIG: ChainConfig = {
+  chainId: XLAYER_MAINNET_CHAIN_ID,
+  chainName: "X Layer mainnet",
+  processor: XLAYER_PROCESSOR, // identical address to testnet (deterministic deploy)
+  adapterRegistry: XLAYER_ADAPTER_REGISTRY,
+  localChainIndex: LOCAL_CHAIN_INDEX, // getChain(0) == 196 (setChain(0,196))
+  adapters: XLAYER_ADAPTERS, // same addresses, independently deployed on 196
+};
+
 /** Supported execution chains, keyed by REAL chainId. */
 export const CHAINS: Record<number, ChainConfig> = {
   [CHAIN_ID]: BASE_SEPOLIA_CONFIG,
   [XLAYER_CHAIN_ID]: XLAYER_CONFIG,
+  [XLAYER_MAINNET_CHAIN_ID]: XLAYER_MAINNET_CONFIG,
 };
 
 export const SUPPORTED_CHAIN_IDS: readonly number[] = Object.values(CHAINS).map(
@@ -491,6 +510,22 @@ export interface CompileRequest {
   initiator?: string; // optional; echoed into summary, not required
   conditions?: ConditionRequest[];
   actions?: ActionRequest[];
+  /**
+   * Safe-by-default expiry policy (decision #6). Controls the auto-injected
+   * absolute timeRange gate that bounds how long this signature stays
+   * replayable:
+   *   - undefined | "auto"  → classify the intent and pick a window
+   *     (immediate 1d · triggered 30d · scheduled waitTime+7d · market unbounded)
+   *   - "none"              → opt out; NO time bound (rely on incrementNonce())
+   *   - <seconds> (Numeric) → explicit window: expires at `now` + seconds
+   * Requires `now` (a unix timestamp) to compute the absolute bound; without it
+   * auto-expiry is skipped and the artifact carries a warning. The ASP injects
+   * `now` server-side, so the live API is safe by default; a direct SDK caller
+   * that wants the guard must pass `now` itself.
+   */
+  expiry?: "auto" | "none" | Numeric;
+  /** Unix seconds used as the clock for `expiry`. Server-injected on the ASP. */
+  now?: Numeric;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +579,29 @@ export interface CompiledIntent {
   readonly steps: readonly CompiledStep[];
   readonly humanSummary: readonly string[];
   readonly warnings: readonly string[];
+  /**
+   * Safe-by-default expiry outcome. `applied` is true when an absolute timeRange
+   * gate was auto-injected as step 0; `endTime` is its unix bound; `className`
+   * is the classification that chose the window. When `applied` is false the
+   * signature has no on-chain time bound (opted out, or `now` was absent).
+   */
+  readonly expiry: {
+    readonly applied: boolean;
+    readonly endTime: string | null;
+    readonly className: string | null;
+  };
+  /**
+   * Worst-case token outflow this signed intent authorizes PER execution — the
+   * amount a replayed signature could move out of the initiator, per token.
+   */
+  readonly exposure: readonly TokenExposure[];
+}
+
+/** Per-token worst-case outflow authorized by an intent. */
+export interface TokenExposure {
+  readonly token: Address;
+  readonly amount: string; // smallest-unit outflow of this token per execution
+  readonly unlimited: boolean; // an unlimited (uint256-max) approval touches it
 }
 
 // ---------------------------------------------------------------------------
@@ -1372,6 +1430,181 @@ function requireAdapter(
 }
 
 // ---------------------------------------------------------------------------
+// Safe-by-default policy: auto-expiry + exposure accounting (decision #6)
+// ---------------------------------------------------------------------------
+
+const DAY_SECONDS = 86_400n;
+
+/**
+ * Absolute-time sentinel (Dec 31, 2199 23:59:59 UTC) reused from the protocol's
+ * "no expiry" convention. A non-recurring timeRange ending here is effectively
+ * unbounded — used for market-gated intents whose resolution time is external.
+ */
+export const INFINITE_EXPIRY = 7_258_118_399n;
+
+/** Per-class relative windows for the auto-expiry safe default. */
+const EXPIRY_WINDOWS = {
+  immediate: DAY_SECONDS, // no gate — should settle right away
+  triggered: 30n * DAY_SECONDS, // price/query/balance/gas gate — needs time to fire
+  scheduledGrace: 7n * DAY_SECONDS, // waitTime target + grace
+} as const;
+
+type ExpiryClass =
+  | "immediate"
+  | "triggered"
+  | "scheduled"
+  | "market"
+  | "custom";
+
+interface AutoExpiry {
+  readonly endTime: bigint;
+  readonly className: ExpiryClass;
+}
+
+/**
+ * Classify an intent and pick an absolute expiry (unix seconds) for the
+ * auto-injected timeRange gate. Returns null when auto-expiry does not apply:
+ * opted out ("none"), no `now` clock, no actions to guard, or an explicit
+ * non-recurring timeRange already bounds the signature's lifetime.
+ */
+function computeAutoExpiry(
+  conditions: ConditionRequest[],
+  actions: ActionRequest[],
+  now: bigint | undefined,
+  expiryOpt: CompileRequest["expiry"]
+): AutoExpiry | null {
+  if (expiryOpt === "none") return null;
+  if (now === undefined) return null; // no time source → cannot bound
+  if (actions.length === 0) return null; // nothing to guard
+
+  // An explicit absolute (non-recurring) timeRange IS the caller's own expiry.
+  const hasAbsoluteWindow = conditions.some(
+    (c) => c && c.type === "timeRange" && c.recurring === false
+  );
+  if (hasAbsoluteWindow) return null;
+
+  // Explicit numeric window overrides classification.
+  if (expiryOpt !== undefined && expiryOpt !== "auto") {
+    const secs = toUint(expiryOpt, "expiry", UINT_MAX.u256);
+    return { endTime: now + secs, className: "custom" };
+  }
+
+  const has = (t: string): boolean =>
+    conditions.some((c) => c && c.type === t);
+
+  // Prediction-market gates resolve on an external schedule — unbounded
+  // lifetime, protected by the gate + allowance + cancel, not by a short clock.
+  if (has("marketResolved") || has("marketOutcome")) {
+    return { endTime: INFINITE_EXPIRY, className: "market" };
+  }
+  // Scheduled (absolute future time): live until the latest waitTime + grace.
+  const waitTimes = conditions
+    .filter(
+      (c): c is Extract<ConditionRequest, { type: "waitTime" }> =>
+        Boolean(c) && c.type === "waitTime"
+    )
+    .map((c) => toUint(c.timestamp, "waitTime.timestamp", UINT_MAX.u256));
+  if (waitTimes.length > 0) {
+    const latest = waitTimes.reduce((a, b) => (b > a ? b : a), 0n);
+    return {
+      endTime: latest + EXPIRY_WINDOWS.scheduledGrace,
+      className: "scheduled",
+    };
+  }
+  // Any trigger gate (price/query/balance/gas/block): moderate window.
+  if (
+    has("price") ||
+    has("waitPriceGte") ||
+    has("waitPriceLte") ||
+    has("query") ||
+    has("balance") ||
+    has("gasPrice") ||
+    has("waitBlock")
+  ) {
+    return { endTime: now + EXPIRY_WINDOWS.triggered, className: "triggered" };
+  }
+  // No trigger conditions — fire immediately, short window.
+  return { endTime: now + EXPIRY_WINDOWS.immediate, className: "immediate" };
+}
+
+/** Build the timeRange EncodedStep for an auto-expiry (startTime 0, end inclusive). */
+function encodeAutoExpiry(exp: AutoExpiry, cfg: ChainConfig): EncodedStep {
+  const input = encodeAbiParameters(parseAbiParameters("uint256, uint256, bool"), [
+    0n,
+    exp.endTime,
+    false,
+  ]);
+  const iso = new Date(Number(exp.endTime) * 1000).toISOString();
+  const unbounded = exp.className === "market";
+  return {
+    input,
+    adapter: requireAdapter(cfg, "timeRange", "timeRange"),
+    value: 0n,
+    summary: `Auto-expiry (safe default, class=${exp.className}): executable only through unix ${exp.endTime.toString()} (${iso})${
+      unbounded
+        ? " — effectively unbounded; protected by the gate + allowance + cancel"
+        : ""
+    }. Bounds signature replay. Opt out with expiry:"none"; set a window with expiry:<seconds>.`,
+    warnings: unbounded
+      ? [
+          "auto-expiry is effectively unbounded (market-gated): the only lifetime protection is the market gate + the token allowance + incrementNonce(). Keep allowances exact and cancel when done.",
+        ]
+      : undefined,
+  };
+}
+
+/**
+ * Worst-case token outflow the signed intent authorizes per execution. Summed
+ * over the actions that move value OUT of the initiator (transfer / swap-in /
+ * aave-deposit / bridge-in); an `approve` contributes its granted amount
+ * (spendable) and flags unlimited (uint256-max) approvals. Runs on
+ * already-validated actions, so re-parsing never throws.
+ */
+function computeExposure(actions: ActionRequest[]): TokenExposure[] {
+  const byToken = new Map<Address, { amount: bigint; unlimited: boolean }>();
+  const add = (tokenRaw: string, amount: bigint, unlimited = false): void => {
+    const token = addr(tokenRaw, "exposure.token");
+    const cur = byToken.get(token) ?? { amount: 0n, unlimited: false };
+    cur.amount += amount;
+    cur.unlimited = cur.unlimited || unlimited;
+    byToken.set(token, cur);
+  };
+  for (const a of actions) {
+    switch (a.type) {
+      case "transfer":
+        add(a.token, toBigInt(a.amount, "transfer.amount"));
+        break;
+      case "approve": {
+        const amt = toBigInt(a.amount, "approve.amount");
+        add(a.token, amt, amt >= UINT_MAX.u256);
+        break;
+      }
+      case "swap":
+        add(a.tokenIn, toBigInt(a.amountIn, "swap.amountIn"));
+        break;
+      case "aaveDeposit":
+        add(a.token, toBigInt(a.amount, "aaveDeposit.amount"));
+        break;
+      case "bridge":
+        add(a.inputToken, toBigInt(a.inputAmount, "bridge.inputAmount"));
+        break;
+      // wrap forwards native ETH via the op value (surfaced separately); aave
+      // withdraw(All) return underlying to the initiator — net inflow, not
+      // counted as outflow exposure here.
+      default:
+        break;
+    }
+  }
+  return [...byToken.entries()]
+    .map(([token, v]) => ({
+      token,
+      amount: v.amount.toString(),
+      unlimited: v.unlimited,
+    }))
+    .sort((a, b) => (a.token < b.token ? -1 : a.token > b.token ? 1 : 0));
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -1398,8 +1631,17 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
   if (conditions.length === 0 && actions.length === 0) {
     throw new ValidationError("intent must contain at least one action or condition");
   }
-  // Bound total work independent of body size (CPU-DoS guard).
-  const totalSteps = conditions.length + actions.length;
+
+  // Safe-by-default expiry (decision #6): classify the intent and, when a `now`
+  // clock is available and the caller has not opted out, auto-inject an absolute
+  // timeRange gate as step 0 to bound how long this signature stays replayable.
+  const now =
+    request.now !== undefined ? toUint(request.now, "now", UINT_MAX.u256) : undefined;
+  const autoExpiry = computeAutoExpiry(conditions, actions, now, request.expiry);
+
+  // Bound total work independent of body size (CPU-DoS guard). Count the
+  // auto-expiry gate against the budget so the on-chain op array can't exceed it.
+  const totalSteps = conditions.length + actions.length + (autoExpiry ? 1 : 0);
   if (totalSteps > MAX_STEPS) {
     throw new ValidationError(
       `intent has ${totalSteps} steps; the maximum is ${MAX_STEPS}`
@@ -1443,6 +1685,11 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     index += 1;
   };
 
+  // Auto-expiry gate goes FIRST so an expired signature pauses before any other
+  // condition or action can run.
+  if (autoExpiry) {
+    pushStep("condition", "timeRange", encodeAutoExpiry(autoExpiry, cfg));
+  }
   for (const cond of conditions) {
     if (cond === null || typeof cond !== "object" || typeof cond.type !== "string") {
       throw new ValidationError("each condition must be an object with a `type`");
@@ -1490,6 +1737,23 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     "REPLAYABLE SIGNATURE: W3CashProcessor.execute() verifies but does NOT consume the nonce (W3CashProcessor.sol:124-138); this signature stays valid and can be re-executed by anyone until the initiator calls incrementNonce(). Damage is bounded by the token allowance granted to each adapter — do NOT sign or grant open-ended/unlimited approvals for transfer/swap/aaveDeposit intents; use incrementNonce() to cancel."
   );
 
+  // Safe-by-default surfacing: worst-case per-execution outflow + expiry status.
+  const exposure = computeExposure(actions);
+  for (const e of exposure) {
+    if (e.unlimited) {
+      warnings.push(
+        `UNLIMITED APPROVAL: this intent grants an unbounded (uint256-max) allowance of ${e.token}; a replayed signature can drain the entire balance. Size the approve amount to exactly what the intent needs.`
+      );
+    }
+  }
+  if (!autoExpiry) {
+    warnings.push(
+      request.expiry === "none"
+        ? "expiry:\"none\" — this signature has NO on-chain time bound; it stays replayable until incrementNonce(). This is an explicit opt-out."
+        : "auto-expiry was NOT applied (no `now` clock provided); this signature has no on-chain time bound. Pass `now` (unix seconds) to enable the safe-default expiry, or cancel via incrementNonce()."
+    );
+  }
+
   const { payload, payloadHash, header, instruction, toSign } = encodeEnvelope(
     operations,
     inputs,
@@ -1504,6 +1768,22 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
   );
   for (const s of steps) {
     humanSummary.push(`#${s.index} [${s.kind}/${s.type}] ${s.summary}`);
+  }
+  humanSummary.push(
+    autoExpiry
+      ? `Expiry: valid until unix ${autoExpiry.endTime.toString()} (${new Date(
+          Number(autoExpiry.endTime) * 1000
+        ).toISOString()}), class=${autoExpiry.className}. Bounds signature replay.`
+      : `Expiry: NONE — signature never time-expires; cancel via incrementNonce().`
+  );
+  if (exposure.length > 0) {
+    humanSummary.push(
+      `Max exposure per execution: ${exposure
+        .map(
+          (e) => `${e.amount}${e.unlimited ? " (UNLIMITED)" : ""} of ${e.token}`
+        )
+        .join(", ")}.`
+    );
   }
 
   return {
@@ -1531,6 +1811,12 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
     steps,
     humanSummary,
     warnings,
+    expiry: {
+      applied: autoExpiry !== null,
+      endTime: autoExpiry ? autoExpiry.endTime.toString() : null,
+      className: autoExpiry ? autoExpiry.className : null,
+    },
+    exposure,
   };
 }
 
@@ -1561,6 +1847,44 @@ export function replayCaveatFor(cfg: ChainConfig): ReplayCaveat {
     replayable: true,
     caveat: REPLAY_CAVEAT.caveat,
     cancel: `Call incrementNonce() on the W3CashProcessor (${cfg.processor}) to invalidate every outstanding signature bound to the current nonce.`,
+  };
+}
+
+/**
+ * bytes4 selector of W3CashProcessor.incrementNonce() — the one-tx "cancel
+ * everything" that advances the initiator's nonce and invalidates every
+ * outstanding signature bound to the current one. keccak256("incrementNonce()").
+ */
+export const INCREMENT_NONCE_SELECTOR = "0x627cdcb9" as Hex;
+
+/** A ready-to-send "cancel all my outstanding intents" transaction descriptor. */
+export interface CancelInstruction {
+  readonly chainId: number;
+  readonly chainName: string;
+  readonly processor: Address;
+  readonly to: Address; // == processor
+  readonly data: Hex; // incrementNonce() calldata (no args)
+  readonly value: string; // "0"
+  readonly note: string;
+}
+
+/**
+ * Build the calldata that cancels every replayable W3Cash signature the
+ * initiator has outstanding on `chain`: a no-arg incrementNonce() call to that
+ * chain's processor. The caller signs+submits it from their own wallet (this
+ * service is non-custodial). Since execute() never consumes the nonce, this is
+ * the ONLY way to invalidate a leaked signature before its expiry.
+ */
+export function cancelInstruction(chain?: Numeric): CancelInstruction {
+  const cfg = resolveChain(chain);
+  return {
+    chainId: cfg.chainId,
+    chainName: cfg.chainName,
+    processor: cfg.processor,
+    to: cfg.processor,
+    data: INCREMENT_NONCE_SELECTOR,
+    value: "0",
+    note: `Submit this transaction from the initiator's own wallet to advance its W3CashProcessor nonce on ${cfg.chainName} (${cfg.chainId}). It invalidates EVERY outstanding signature bound to the current nonce in one tx. Non-custodial: this service does not sign or send it.`,
   };
 }
 
@@ -1838,6 +2162,13 @@ export const XLAYER_KNOWN_ADDRESSES = {
   sampleWallet: getAddress("0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"), // example recipient/holder
 } as const;
 
+/** X Layer MAINNET (196) known addresses. USD₮0 is the canonical LayerZero OFT
+ *  (also the x402 mainnet settlement asset). */
+export const XLAYER_MAINNET_KNOWN_ADDRESSES = {
+  usdt0: getAddress("0x779Ded0c9e1022225f8E0630b35a9b54bE713736"), // USD₮0 (X Layer mainnet)
+  sampleWallet: getAddress("0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3"),
+} as const;
+
 export interface Recipe {
   readonly id: string;
   readonly title: string;
@@ -1863,7 +2194,10 @@ export interface RecipeBook {
  * the intents an OKX Agentic Wallet can sign (no PK export) and settle gas-free.
  */
 function getXLayerRecipes(cfg: ChainConfig): RecipeBook {
-  const K = XLAYER_KNOWN_ADDRESSES;
+  const isMainnet = cfg.chainId === XLAYER_MAINNET_CHAIN_ID;
+  const K = isMainnet ? XLAYER_MAINNET_KNOWN_ADDRESSES : XLAYER_KNOWN_ADDRESSES;
+  const net = isMainnet ? "X Layer mainnet" : "X Layer testnet";
+  const usdt0Short = isMainnet ? "0x779Ded…" : "0x9e29…";
   return {
     chainId: cfg.chainId,
     processor: cfg.processor,
@@ -1919,9 +2253,9 @@ function getXLayerRecipes(cfg: ChainConfig): RecipeBook {
       },
     ],
     notes: [
-      `X Layer testnet (${cfg.chainId}) minimal core: transfer/approve + time/block/gas/query/co-signer gates only. No swap/aave/wrap/bridge (Uniswap/Aave/Across absent).`,
+      `${net} (${cfg.chainId}) minimal core: transfer/approve + time/block/gas/query/co-signer gates only. No swap/aave/wrap/bridge (Uniswap/Aave/Across absent).`,
       "Every recipe compiles to a REPLAYABLE signature (see `replay`); cancel with incrementNonce().",
-      "USD₮0 (0x9e29...) is the X Layer testnet USDT; amounts are in its smallest unit. Approve the X Layer TransferAdapter for USD₮0 before signing a transfer intent.",
+      `USD₮0 (${usdt0Short}) is the ${net} USDT; amounts are in its smallest unit (6 decimals). Approve the X Layer TransferAdapter for USD₮0 before signing a transfer intent.`,
       "POST any recipe's `request` object to /compile-intent to get the signable envelope.",
     ],
   };
@@ -1934,7 +2268,9 @@ function getXLayerRecipes(cfg: ChainConfig): RecipeBook {
  */
 export function getRecipes(chain?: Numeric): RecipeBook {
   const cfg = resolveChain(chain);
-  if (cfg.chainId === XLAYER_CHAIN_ID) return getXLayerRecipes(cfg);
+  if (cfg.chainId === XLAYER_CHAIN_ID || cfg.chainId === XLAYER_MAINNET_CHAIN_ID) {
+    return getXLayerRecipes(cfg);
+  }
   const K = KNOWN_ADDRESSES;
   return {
     chainId: CHAIN_ID,

@@ -10,6 +10,7 @@ import {
   compileIntent,
   getCapabilities,
   getRecipes,
+  cancelInstruction,
   ValidationError,
   PROCESSOR,
   CHAIN_ID,
@@ -120,6 +121,21 @@ app.get("/recipes", (req: Request, res: Response) => {
   try {
     const chain = typeof req.query.chain === "string" ? req.query.chain : undefined;
     res.status(200).json({ ok: true, recipes: getRecipes(chain) });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
+});
+
+// Cancel-all instruction — the one-tx incrementNonce() calldata that invalidates
+// every outstanding replayable signature the initiator holds on ?chain=.
+app.get("/cancel", (req: Request, res: Response) => {
+  try {
+    const chain = typeof req.query.chain === "string" ? req.query.chain : undefined;
+    res.status(200).json({ ok: true, cancel: cancelInstruction(chain) });
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
@@ -251,6 +267,12 @@ const compileHandler: RequestHandler = async (req: Request, res: Response) => {
   try {
     const body = req.body as CompileRequest;
     await applyBridgeAutoQuote(body);
+    // Safe-by-default (decision #6): inject the server clock so the auto-expiry
+    // gate is applied unless the caller explicitly opted out (expiry:"none") or
+    // supplied their own `now`. Keeps the live API safe by default.
+    if (body && typeof body === "object" && body.now === undefined) {
+      body.now = Math.floor(Date.now() / 1000);
+    }
     const intent = compileIntent(body);
     res.status(200).json({ ok: true, intent });
   } catch (err) {
@@ -298,9 +320,12 @@ const getCompileHandler: RequestHandler = (req: Request, res: Response) => {
   try {
     const chain =
       typeof req.query.chain === "string" ? req.query.chain : undefined;
-    const request: CompileRequest = chain
-      ? { ...SAMPLE_REQUEST, chain }
-      : SAMPLE_REQUEST;
+    // Fresh object each call (never mutate SAMPLE_REQUEST); inject the server
+    // clock so the sample shows the safe-by-default expiry gate too.
+    const request: CompileRequest = {
+      ...(chain ? { ...SAMPLE_REQUEST, chain } : SAMPLE_REQUEST),
+      now: Math.floor(Date.now() / 1000),
+    };
     const intent = compileIntent(request);
     res.status(200).json({
       ok: true,

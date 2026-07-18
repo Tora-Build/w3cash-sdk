@@ -7,6 +7,8 @@ import {
   signatureMessageHash,
   ValidationError,
   XLAYER_CHAIN_ID,
+  XLAYER_MAINNET_CHAIN_ID,
+  XLAYER_MAINNET_KNOWN_ADDRESSES,
   XLAYER_PROCESSOR,
   XLAYER_ADAPTERS,
   CHAIN_ID,
@@ -128,5 +130,51 @@ describe("X Layer testnet (1952) routing", () => {
       actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
     });
     expect(intent.chainId).toBe(CHAIN_ID);
+  });
+});
+
+describe("X Layer MAINNET (196) routing", () => {
+  it("compiles a transfer to the X Layer core on chain 196", () => {
+    const intent = compileIntent({
+      chain: XLAYER_MAINNET_CHAIN_ID,
+      conditions: [{ type: "waitTime", timestamp: "1767225600" }],
+      actions: [
+        { type: "transfer", token: XLAYER_MAINNET_KNOWN_ADDRESSES.usdt0, to: DEAD, amount: "1000000" },
+      ],
+    });
+    expect(intent.chainId).toBe(196);
+    expect(intent.processor).toBe(XLAYER_PROCESSOR); // same deterministic address
+    expect(opTarget(intent.operations[1])).toBe(XLAYER_ADAPTERS.transfer.address);
+  });
+
+  it("getCapabilities(196) reports the X Layer mainnet minimal core", () => {
+    const caps = getCapabilities(XLAYER_MAINNET_CHAIN_ID);
+    expect(caps.chainId).toBe(196);
+    expect(caps.chainName).toBe("X Layer mainnet");
+    expect(caps.counts.actionTypes).toBe(2); // transfer + approve only
+    expect(caps.counts.deployedAdapters).toBe(7);
+  });
+
+  it("getRecipes(196) uses mainnet USD₮0 (0x779Ded…) and all compile", () => {
+    const book = getRecipes(XLAYER_MAINNET_CHAIN_ID);
+    expect(book.chainId).toBe(196);
+    for (const r of book.recipes) {
+      const intent = compileIntent(r.request);
+      expect(intent.chainId).toBe(196);
+    }
+    // A transfer recipe must reference the mainnet USD₮0 token.
+    const transferRecipe = book.recipes.find((r) =>
+      (r.request.actions ?? []).some((a) => a.type === "transfer")
+    );
+    expect(transferRecipe).toBeDefined();
+  });
+
+  it("rejects swap/aave on X Layer mainnet (minimal core only)", () => {
+    expect(() =>
+      compileIntent({
+        chain: XLAYER_MAINNET_CHAIN_ID,
+        actions: [{ type: "aaveWithdrawAll", token: USDC } as never],
+      })
+    ).toThrow(ValidationError);
   });
 });

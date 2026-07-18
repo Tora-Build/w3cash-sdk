@@ -3,8 +3,9 @@ name: w3cash-intent-compiler
 description: >-
   Compile natural-language on-chain goals into non-custodial, ready-to-sign
   W3Cash intents via the W3Cash MCP server, then sign and execute them. Works on
-  Base Sepolia (chain 84532, full DeFi action set) and X Layer testnet (chain
-  1952, minimal core). Use whenever the user wants an on-chain action that runs
+  Base Sepolia (chain 84532, full DeFi action set), X Layer testnet (chain 1952,
+  minimal core), and X Layer MAINNET (chain 196, minimal core, REAL funds). Use
+  whenever the user wants an on-chain action that runs
   "only when" a condition holds — e.g. "swap 100 USDC to WETH when ETH drops
   below $3000", "send 0.1 USDT0 to 0x… when my wallet holds at least 1", "bridge
   when gas is cheap", DCA / buy-the-dip / stop-loss, or any time-, price-,
@@ -40,9 +41,12 @@ the chain actually deploys, and returns that chain's processor + adapter address
 | --- | --- | --- | --- |
 | Base Sepolia | `84532` | `0x0fdFB12E72b08289F1374E69aCa39D69A279fdcE` | full: transfer, approve, swap, aave*, wrap, bridge |
 | X Layer testnet | `1952` | `0x3C06E44bD4d09328a4c374174b8e325c0C674b6E` | minimal core: transfer, approve (+ all gates). NO swap/aave/wrap/bridge |
+| **X Layer mainnet** | `196` | `0x3C06E44bD4d09328a4c374174b8e325c0C674b6E` | minimal core (same as testnet) — **REAL funds**. USD₮0 = `0x779Ded0c9e1022225f8E0630b35a9b54bE713736` |
 
 Every condition (time / block / price / balance / query / gas / co-signer /
-market) is available on **both** chains.
+market) is available on **all three** chains. X Layer USD₮0 is `0x9e29…` on
+testnet and `0x779Ded…` on mainnet (both 6 decimals). The X Layer core lives at
+the **same addresses** on 1952 and 196 (deterministic deploy).
 
 ## Tools
 
@@ -52,6 +56,7 @@ market) is available on **both** chains.
 | `w3cash_compile_intent` | Compile `{chain, initiator, nonce, conditions[], actions[]}` → signable intent. |
 | `w3cash_bridge_quote`   | Preview a live Across quote before a cross-chain `bridge` (Base Sepolia).    |
 | `w3cash_recipes`        | Ready-to-edit templates for the given `chain`.                              |
+| `w3cash_cancel_all`     | Get the one-tx `incrementNonce()` calldata to invalidate ALL outstanding intents. |
 
 ## Amounts & decimals (convert yourself — never ask the user for base units)
 
@@ -160,23 +165,26 @@ intent hash used, or embed a signed deadline) — a hardening item; a stateless
 compiler cannot enforce it. What the **caller** must do:
 
 1. **Bounded approvals only** — never unlimited. Approve exactly the action's
-   amount; damage is capped at the allowance.
+   amount; damage is capped at the allowance. The compiled result now returns an
+   `exposure` array (worst-case per-execution outflow per token) and flags any
+   unlimited approval in `warnings` — relay it.
 2. **Cancel is coarse** — `nonces` is ONE counter per user, shared by all their
    intents. `incrementNonce()` invalidates **every** intent at the current nonce
-   at once; there is no per-intent cancel. (A signed payload is also public in the
-   tx calldata after the first submit.)
-3. **Expiry — non-blocking.** Do NOT pause mid-flow to ask about an expiry; it
-   stalls execution. Just proceed (the bounded allowance already caps exposure),
-   and in your **final summary** note that the signature is replayable and that
-   you can add an auto-expiry or `incrementNonce()` on request. Proactively add an
-   expiry only when the user asks, or when the intent grants a large/open-ended
-   allowance. To add one: prepend a **`timeRange` window** condition
-   `{ "type": "timeRange", "startTime": "<unix now>", "endTime": "<unix now + N>", "recurring": false }`
-   (`now` = `date +%s`); after `endTime` the intent can never execute. Recurring
-   intents skip it.
+   at once; there is no per-intent cancel. Use **`w3cash_cancel_all`** to fetch
+   the ready-to-send `incrementNonce()` calldata (`{ to, data, value }`) for the
+   chain; the initiator signs+submits it from its own wallet. (A signed payload
+   is also public in the tx calldata after the first submit.)
+3. **Expiry — safe by default, non-blocking.** The ASP now **auto-adds** an
+   absolute expiry to every compiled intent (short for one-shot, ~30d for a
+   triggered gate, until-target+grace for scheduled, effectively unbounded for
+   market-gated). You do NOT need to add a `timeRange` yourself and must NOT pause
+   to ask about it. The result carries `expiry` (`{ applied, endTime, className }`)
+   — surface it in your final summary. To widen/narrow it, pass
+   `expiry: <seconds>`; to disable it entirely (rarely — it removes the time
+   bound), pass `expiry: "none"`.
 
-Relay `warnings` + this replay note in the final summary — as information, not a
-blocking question.
+Relay `warnings` + `expiry` + `exposure` in the final summary — as information,
+not a blocking question.
 
 ## Worked examples
 

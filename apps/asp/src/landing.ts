@@ -1,6 +1,6 @@
 /**
  * Minimal, self-contained landing page served at GET / on the ASP domain.
- * Read-only: fetches /capabilities for both chains and renders them prettily, so
+ * Read-only: fetches /capabilities for all three chains and renders them prettily, so
  * asp.w3.cash doubles as the "live service" visual and the capabilities viewer.
  * No wallet, no execution, no external assets (inline CSS/JS only).
  */
@@ -87,6 +87,15 @@ export const LANDING_HTML = `<!doctype html>
       </div>
       <div class="mono" id="xl-proc" style="margin-top:10px"></div>
     </div>
+    <div class="card">
+      <h3>X Layer mainnet <span class="chain">chain 196 &middot; live</span></h3>
+      <div class="stats">
+        <div class="stat"><b id="xm-a">2</b><span>action types</span></div>
+        <div class="stat"><b id="xm-c">12</b><span>condition types</span></div>
+        <div class="stat"><b id="xm-d">7</b><span>adapters</span></div>
+      </div>
+      <div class="mono" id="xm-proc" style="margin-top:10px"></div>
+    </div>
   </div>
 
   <div class="sec">
@@ -112,9 +121,10 @@ export const LANDING_HTML = `<!doctype html>
     <pre class="cmd">claude mcp add --transport http w3cash https://asp.w3.cash/mcp</pre>
     <p class="lead" style="font-size:14px;margin:2px 0 12px">Four self-describing tools, plus the full usage skill served as a resource (<span class="mono" style="color:#7f96e0">w3cash://skill</span>) &mdash; so one command delivers the tools <em>and</em> their how-to.</p>
     <div class="links">
-      <a class="btn pri" href="/capabilities?chain=1952">/capabilities (X Layer)</a>
+      <a class="btn pri" href="/capabilities?chain=196">/capabilities (X Layer mainnet)</a>
+      <a class="btn" href="/capabilities?chain=1952">/capabilities (X Layer testnet)</a>
       <a class="btn" href="/capabilities">/capabilities (Base Sepolia)</a>
-      <a class="btn" href="/recipes?chain=1952">/recipes</a>
+      <a class="btn" href="/recipes?chain=196">/recipes</a>
       <a class="btn" href="/mcp">/mcp endpoint</a>
     </div>
   </div>
@@ -144,9 +154,9 @@ export const LANDING_HTML = `<!doctype html>
     }
   }
   function j(url) { return fetch(url).then(function (r) { return r.json(); }); }
-  Promise.all([j('/capabilities'), j('/capabilities?chain=1952')]).then(function (res) {
-    var bs = res[0] && res[0].capabilities, xl = res[1] && res[1].capabilities;
-    fill(bs, 'bs'); fill(xl, 'xl');
+  Promise.all([j('/capabilities'), j('/capabilities?chain=1952'), j('/capabilities?chain=196')]).then(function (res) {
+    var bs = res[0] && res[0].capabilities, xl = res[1] && res[1].capabilities, xm = res[2] && res[2].capabilities;
+    fill(bs, 'bs'); fill(xl, 'xl'); fill(xm, 'xm');
     if (bs) { chips(document.getElementById('actions'), bs.actions, ''); chips(document.getElementById('conditions'), bs.conditions, 'cond'); }
   }).catch(function () {});
 })();

@@ -6,6 +6,7 @@ import {
   encodePacked,
   getAddress,
   slice,
+  toFunctionSelector,
   type Hex,
 } from "viem";
 import {
@@ -15,6 +16,8 @@ import {
   encodeSignedPayload,
   getCapabilities,
   getRecipes,
+  cancelInstruction,
+  INCREMENT_NONCE_SELECTOR,
   signatureMessageHash,
   ValidationError,
   ADAPTERS,
@@ -784,5 +787,176 @@ describe("capabilities catalog", () => {
     expect(caps.counts.conditionTypes).toBe(12);
     expect(caps.counts.deployedAdapters).toBe(11);
     expect(caps.replay.replayable).toBe(true);
+  });
+});
+
+describe("safe-by-default expiry + exposure (decision #6)", () => {
+  const NOW = 1_800_000_000;
+  const DAY = 86_400;
+  const withNow = (req: CompileRequest): CompileRequest => ({ ...req, now: NOW });
+
+  it("no `now` clock → no auto-expiry, and the artifact warns", () => {
+    const intent = compileIntent(goldenRequest());
+    expect(intent.expiry.applied).toBe(false);
+    expect(intent.expiry.endTime).toBeNull();
+    expect(intent.operations).toHaveLength(2); // unchanged golden shape
+    expect(
+      intent.warnings.some((w) => w.includes("auto-expiry was NOT applied"))
+    ).toBe(true);
+  });
+
+  it('expiry:"none" opts out even when `now` is present', () => {
+    const intent = compileIntent(withNow({ ...goldenRequest(), expiry: "none" }));
+    expect(intent.expiry.applied).toBe(false);
+    expect(intent.operations).toHaveLength(2);
+    expect(intent.warnings.some((w) => w.includes('expiry:"none"'))).toBe(true);
+  });
+
+  it("prepends the expiry gate as step 0 (scheduled class = latest waitTime + 7d)", () => {
+    const intent = compileIntent(withNow(goldenRequest()));
+    expect(intent.operations).toHaveLength(3);
+    expect(intent.steps[0].kind).toBe("condition");
+    expect(intent.steps[0].type).toBe("timeRange");
+    expect(intent.expiry.applied).toBe(true);
+    expect(intent.expiry.className).toBe("scheduled");
+    expect(intent.expiry.endTime).toBe(String(1 + 7 * DAY)); // waitTime=1 + grace
+    // Decoded gate input is [start=0, end, recurring=false].
+    const [start, end, recurring] = decodeAbiParameters(
+      parseAbiParameters("uint256, uint256, bool"),
+      intent.inputs[0]
+    );
+    expect(start).toBe(0n);
+    expect(end).toBe(BigInt(1 + 7 * DAY));
+    expect(recurring).toBe(false);
+  });
+
+  it("triggered class (price gate) → now + 30d", () => {
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        conditions: [
+          { type: "price", feed: DEAD, operator: "lte", targetPrice: "100" },
+        ],
+        actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
+      })
+    );
+    expect(intent.expiry.className).toBe("triggered");
+    expect(intent.expiry.endTime).toBe(String(NOW + 30 * DAY));
+  });
+
+  it("immediate class (no gate) → now + 1d", () => {
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
+      })
+    );
+    expect(intent.expiry.className).toBe("immediate");
+    expect(intent.expiry.endTime).toBe(String(NOW + DAY));
+  });
+
+  it("market class → effectively unbounded (year-2199 sentinel)", () => {
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        conditions: [{ type: "marketResolved", market: DEAD }],
+        actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
+      })
+    );
+    expect(intent.expiry.className).toBe("market");
+    expect(intent.expiry.endTime).toBe("7258118399");
+    expect(
+      intent.warnings.some((w) => w.includes("effectively unbounded"))
+    ).toBe(true);
+  });
+
+  it("explicit numeric expiry overrides classification (now + seconds)", () => {
+    const intent = compileIntent(withNow({ ...goldenRequest(), expiry: 3600 }));
+    expect(intent.expiry.className).toBe("custom");
+    expect(intent.expiry.endTime).toBe(String(NOW + 3600));
+  });
+
+  it("respects a caller-supplied absolute timeRange (no double expiry)", () => {
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        conditions: [
+          { type: "timeRange", startTime: 0, endTime: NOW + 100, recurring: false },
+        ],
+        actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
+      })
+    );
+    expect(intent.expiry.applied).toBe(false); // caller's window is the expiry
+    expect(intent.operations).toHaveLength(2);
+  });
+
+  it("recurring timeRange is NOT an expiry → still injects an absolute bound", () => {
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        conditions: [
+          { type: "timeRange", startTime: 9, endTime: 17, recurring: true },
+        ],
+        actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1" }],
+      })
+    );
+    expect(intent.expiry.applied).toBe(true);
+    expect(intent.operations).toHaveLength(3);
+  });
+
+  it("computes per-token exposure and flags unlimited approvals", () => {
+    const MAXU = (2n ** 256n - 1n).toString();
+    const intent = compileIntent(
+      withNow({
+        chain: CHAIN_ID,
+        actions: [
+          { type: "transfer", token: USDC, to: DEAD, amount: "1000000" },
+          { type: "approve", token: USDC, spender: DEAD, amount: MAXU },
+        ],
+      })
+    );
+    const usdc = intent.exposure.find((e) => e.token === USDC);
+    expect(usdc?.unlimited).toBe(true);
+    expect(
+      intent.warnings.some((w) => w.includes("UNLIMITED APPROVAL"))
+    ).toBe(true);
+  });
+
+  it("counts the expiry gate against MAX_STEPS", () => {
+    const actions = Array.from({ length: MAX_STEPS }, () => ({
+      type: "transfer" as const,
+      token: USDC,
+      to: DEAD,
+      amount: "1",
+    }));
+    // MAX_STEPS actions + 1 auto-expiry gate = MAX_STEPS+1 → rejected.
+    expect(() => compileIntent(withNow({ chain: CHAIN_ID, actions }))).toThrow(
+      ValidationError
+    );
+  });
+});
+
+describe("cancel-all (incrementNonce) instruction", () => {
+  it("INCREMENT_NONCE_SELECTOR matches keccak256(incrementNonce())", () => {
+    expect(INCREMENT_NONCE_SELECTOR).toBe(toFunctionSelector("incrementNonce()"));
+    expect(INCREMENT_NONCE_SELECTOR).toBe("0x627cdcb9");
+  });
+
+  it("builds a non-custodial cancel tx descriptor for the default chain", () => {
+    const c = cancelInstruction();
+    expect(c.chainId).toBe(CHAIN_ID);
+    expect(c.to).toBe(c.processor);
+    expect(c.data).toBe(INCREMENT_NONCE_SELECTOR);
+    expect(c.value).toBe("0");
+  });
+
+  it("resolves X Layer testnet (1952) to its own processor", () => {
+    const c = cancelInstruction(1952);
+    expect(c.chainId).toBe(1952);
+    expect(c.processor).not.toBe(cancelInstruction(CHAIN_ID).processor);
+  });
+
+  it("throws ValidationError on an unsupported chain", () => {
+    expect(() => cancelInstruction(1)).toThrow(ValidationError);
   });
 });

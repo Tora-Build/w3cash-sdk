@@ -108,11 +108,52 @@ describe("GET /recipes", () => {
   });
 });
 
+describe("GET /cancel", () => {
+  it("returns the incrementNonce() cancel-all calldata for the default chain", async () => {
+    const res = await fetch(base + "/cancel");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      cancel: {
+        chainId: number;
+        processor: string;
+        to: string;
+        data: string;
+        value: string;
+      };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.cancel.chainId).toBe(CHAIN_ID);
+    expect(body.cancel.data).toBe("0x627cdcb9");
+    expect(body.cancel.value).toBe("0");
+    expect(body.cancel.to).toBe(body.cancel.processor);
+  });
+
+  it("resolves ?chain=1952 to the X Layer processor", async () => {
+    const res = await fetch(base + "/cancel?chain=1952");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      cancel: { chainId: number; data: string };
+    };
+    expect(body.cancel.chainId).toBe(1952);
+    expect(body.cancel.data).toBe("0x627cdcb9");
+  });
+
+  it("rejects an unsupported chain with a 400", async () => {
+    const res = await fetch(base + "/cancel?chain=1");
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("POST /compile-intent — happy path", () => {
   it("compiles a conditional transfer and returns the signable envelope", async () => {
     const { status, body } = await postJson("/compile-intent", {
       chain: CHAIN_ID,
       nonce: 0,
+      // Opt out of the safe-default expiry so this stays a deterministic golden
+      // vector (the auto-expiry endTime is wall-clock and would move toSign).
+      expiry: "none",
       conditions: [{ type: "waitTime", timestamp: 1 }],
       actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1000000" }],
     });
@@ -128,6 +169,7 @@ describe("POST /compile-intent — happy path", () => {
       signing: { scheme: string; replayable: boolean };
       steps: { kind: string; type: string }[];
       warnings: string[];
+      expiry: { applied: boolean; endTime: string | null };
     };
     expect(intent.chainId).toBe(CHAIN_ID);
     expect(intent.operations).toHaveLength(2);
@@ -139,21 +181,67 @@ describe("POST /compile-intent — happy path", () => {
     expect(intent.signing.scheme).toBe("eip191-personal-sign");
     expect(intent.signing.replayable).toBe(true);
     expect(intent.steps.map((s) => s.kind)).toEqual(["condition", "action"]);
+    // Opted out → no expiry gate, and the artifact says so.
+    expect(intent.expiry.applied).toBe(false);
+    expect(intent.warnings.some((w) => w.includes('expiry:"none"'))).toBe(true);
     // Replay caveat is always surfaced in the artifact the signer consumes.
     expect(
       intent.warnings.some((w) => w.includes("REPLAYABLE SIGNATURE"))
     ).toBe(true);
   });
 
-  it("compiles an action-only intent (aaveWithdrawAll)", async () => {
+  it("applies a safe-default expiry when none is specified", async () => {
+    // Pass an explicit `now` so the injected timeRange endTime is deterministic.
+    const now = 1_800_000_000;
+    const { status, body } = await postJson("/compile-intent", {
+      chain: CHAIN_ID,
+      now,
+      conditions: [{ type: "waitTime", timestamp: 1 }],
+      actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1000000" }],
+    });
+    expect(status).toBe(200);
+    const intent = body.intent as {
+      operations: string[];
+      steps: { kind: string; type: string }[];
+      expiry: { applied: boolean; endTime: string | null; className: string | null };
+      exposure: { token: string; amount: string; unlimited: boolean }[];
+    };
+    // Expiry gate is prepended as step 0 → 3 ops (expiry + waitTime + transfer).
+    expect(intent.operations).toHaveLength(3);
+    expect(intent.steps.map((s) => s.type)[0]).toBe("timeRange");
+    expect(intent.steps.map((s) => s.kind)).toEqual([
+      "condition",
+      "condition",
+      "action",
+    ]);
+    expect(intent.expiry.applied).toBe(true);
+    // Scheduled class: latest waitTime (1) + 7d grace.
+    expect(intent.expiry.className).toBe("scheduled");
+    expect(intent.expiry.endTime).toBe(String(1 + 7 * 86400));
+    // Exposure reflects the transfer amount.
+    expect(intent.exposure).toEqual([
+      { token: USDC, amount: "1000000", unlimited: false },
+    ]);
+  });
+
+  it("compiles an action-only intent (aaveWithdrawAll) with a safe-default expiry", async () => {
     const { status, body } = await postJson("/compile-intent", {
       actions: [{ type: "aaveWithdrawAll", token: USDC }],
     });
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
-    const intent = body.intent as { operations: string[]; inputs: string[] };
-    expect(intent.operations).toHaveLength(1);
-    expect(intent.inputs[0].startsWith("0xfa09e630")).toBe(true);
+    const intent = body.intent as {
+      operations: string[];
+      inputs: string[];
+      steps: { type: string }[];
+      expiry: { applied: boolean; className: string | null };
+    };
+    // Server injects `now` → immediate-class expiry prepended, then the aave op.
+    expect(intent.operations).toHaveLength(2);
+    expect(intent.steps[0].type).toBe("timeRange");
+    expect(intent.expiry.applied).toBe(true);
+    expect(intent.expiry.className).toBe("immediate");
+    expect(intent.inputs[1].startsWith("0xfa09e630")).toBe(true);
   });
 
   it("parses a body sent as text/plain (content-type agnostic, W3C-ASP-03)", async () => {

@@ -31,14 +31,16 @@ function present(result: Awaited<ReturnType<typeof aspGet>>): ToolResult {
 
 const SERVER_INSTRUCTIONS = [
   "W3Cash compiles a structured goal into a non-custodial, ready-to-sign on-chain",
-  "intent. Two chains are supported: Base Sepolia (84532, default) and X Layer",
-  "testnet (1952). The mental model is \"do X only when Y\": ACTIONS (X) run only",
-  "after every CONDITION gate (Y) is satisfied, in order.",
+  "intent. Three chains are supported: Base Sepolia (84532, default), X Layer",
+  "testnet (1952), and X Layer MAINNET (196 — real funds). The mental model is",
+  "\"do X only when Y\": ACTIONS (X) run only after every CONDITION gate (Y) is",
+  "satisfied, in order.",
   "",
   "Chain note: Base Sepolia has the full action set (transfer/approve/swap/aave/",
-  "wrap/bridge). X Layer testnet is a minimal core — transfer/approve plus every",
-  "gate (time/block/gas/balance/price/query/co-signer/market); swap/aave/wrap/",
-  "bridge are NOT available there. Pass the target chain id (default 84532).",
+  "wrap/bridge). Both X Layer chains (testnet 1952 + mainnet 196) are a minimal",
+  "core — transfer/approve plus every gate (time/block/gas/balance/price/query/",
+  "co-signer/market); swap/aave/wrap/bridge are NOT available there. X Layer USD₮0",
+  "is 0x9e29… on testnet and 0x779Ded… on mainnet. Pass the target chain id (default 84532).",
   "",
   "Workflow: (1) call w3cash_capabilities FIRST (optionally with a chain) to learn",
   "the exact action/condition field names for that chain; (2) call",
@@ -68,7 +70,8 @@ export function registerTools(server: McpServer): void {
         "Discover what the W3Cash Intent Compiler can do ON A GIVEN CHAIN. CALL THIS " +
         "FIRST, before w3cash_compile_intent, to learn the exact field names for every " +
         "action and condition available on the target chain. Pass `chain` (84532 Base " +
-        "Sepolia default, or 1952 X Layer testnet); the returned action/condition set is " +
+        "Sepolia default, 1952 X Layer testnet, or 196 X Layer mainnet); the returned " +
+        "action/condition set is " +
         "filtered to what that chain actually deploys — e.g. X Layer omits swap/aave/" +
         "wrap/bridge. Returns the supported ACTIONS " +
         "(transfer, approve, [swap, aaveDeposit, aaveWithdraw, aaveWithdrawAll, wrap, " +
@@ -84,7 +87,7 @@ export function registerTools(server: McpServer): void {
           .int()
           .optional()
           .default(84532)
-          .describe("EVM chain id: 84532 (Base Sepolia, default) or 1952 (X Layer testnet)."),
+          .describe("EVM chain id: 84532 (Base Sepolia, default), 1952 (X Layer testnet), or 196 (X Layer mainnet)."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -118,14 +121,24 @@ export function registerTools(server: McpServer): void {
         "• Bridge when gas is cheap (server auto-fetches the Across quote): " +
         "conditions=[{\"type\":\"gasPrice\",\"operator\":\"lte\",\"threshold\":\"20000000000\"}], " +
         "actions=[{\"type\":\"bridge\",\"autoQuote\":true,\"recipient\":\"0x<dest>\"," +
-        "\"destinationChainId\":11155111,\"inputToken\":\"0x<weth>\",\"inputAmount\":\"5000000\"}]",
+        "\"destinationChainId\":11155111,\"inputToken\":\"0x<weth>\",\"inputAmount\":\"5000000\"}]\n\n" +
+        "SAFE BY DEFAULT: unless you pass expiry:\"none\", the compiler auto-adds an " +
+        "absolute time bound so the signature can't be replayed forever (short for " +
+        "one-shot, ~30d for triggered, until-target+grace for scheduled, unbounded for " +
+        "market-gated). The result includes `expiry` (the applied bound) and `exposure` " +
+        "(worst-case per-execution token outflow); to cancel outstanding intents use " +
+        "w3cash_cancel_all.",
       inputSchema: {
         chain: z
           .number()
           .int()
           .optional()
           .default(84532)
-          .describe("EVM chain id: 84532 (Base Sepolia, default) or 1952 (X Layer testnet). X Layer supports transfer/approve + all gates but NOT swap/aave/wrap/bridge."),
+          .describe("EVM chain id: 84532 (Base Sepolia, default), 1952 (X Layer testnet), or 196 (X Layer mainnet). X Layer supports transfer/approve + all gates but NOT swap/aave/wrap/bridge."),
+        expiry: z
+          .union([z.literal("auto"), z.literal("none"), z.number().int().nonnegative()])
+          .optional()
+          .describe("Safe-default expiry policy. Omit/\"auto\" = classify and add a sensible time bound (recommended). \"none\" = opt out (NO time bound — stays replayable until incrementNonce()). A number = explicit window in seconds from now."),
         nonce: z
           .number()
           .int()
@@ -152,8 +165,40 @@ export function registerTools(server: McpServer): void {
       if (args.initiator !== undefined) body.initiator = args.initiator;
       if (args.conditions !== undefined) body.conditions = args.conditions;
       if (args.actions !== undefined) body.actions = args.actions;
+      if (args.expiry !== undefined) body.expiry = args.expiry;
       return present(await aspPost("/compile-intent", body));
     },
+  );
+
+  // -------------------------------------------------------------------------
+  // 5. Cancel all — the one-tx incrementNonce() calldata that invalidates
+  //    every outstanding replayable signature the initiator holds on a chain.
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "w3cash_cancel_all",
+    {
+      title: "W3Cash: cancel all outstanding intents",
+      description:
+        "Get the one-transaction \"cancel everything\" calldata for a chain. A compiled " +
+        "W3Cash signature stays REPLAYABLE until the initiator's on-chain nonce advances " +
+        "(execute() verifies but never consumes it), so this is how an initiator " +
+        "invalidates ALL of its outstanding intents at once — including any leaked " +
+        "signature — before their expiry. Returns { to, data, value } for a no-arg " +
+        "W3CashProcessor.incrementNonce() call on the given `chain`; the initiator " +
+        "signs and submits it from its OWN wallet (this service is non-custodial and " +
+        "never sends it). Use after a key exposure, or to retire intents you no longer " +
+        "want executable.",
+      inputSchema: {
+        chain: z
+          .number()
+          .int()
+          .optional()
+          .default(84532)
+          .describe("EVM chain id: 84532 (Base Sepolia, default), 1952 (X Layer testnet), or 196 (X Layer mainnet)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => present(await aspGet(`/cancel?chain=${args.chain ?? 84532}`)),
   );
 
   // -------------------------------------------------------------------------
@@ -214,9 +259,10 @@ export function registerTools(server: McpServer): void {
       description:
         "Return canned, ready-to-use example request bodies for common automations, for " +
         "the given `chain`. Base Sepolia (84532, default): DCA, buy-the-dip, Aave " +
-        "stop-loss, cross-chain sweep, prediction-gated withdraw. X Layer testnet (1952): " +
-        "scheduled-transfer, gas-gated-transfer, balance-gated-transfer (transfer + gates " +
-        "only). Use these as templates: copy a recipe's body, swap in real addresses/" +
+        "stop-loss, cross-chain sweep, prediction-gated withdraw. X Layer testnet (1952) " +
+        "and X Layer mainnet (196): scheduled-transfer, gas-gated-transfer, " +
+        "balance-gated-transfer (transfer + gates only, over USD₮0). Use these as " +
+        "templates: copy a recipe's body, swap in real addresses/" +
         "amounts, and pass it to w3cash_compile_intent. Also returns the replay caveat.",
       inputSchema: {
         chain: z
@@ -224,7 +270,7 @@ export function registerTools(server: McpServer): void {
           .int()
           .optional()
           .default(84532)
-          .describe("EVM chain id: 84532 (Base Sepolia, default) or 1952 (X Layer testnet)."),
+          .describe("EVM chain id: 84532 (Base Sepolia, default), 1952 (X Layer testnet), or 196 (X Layer mainnet)."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
