@@ -4,22 +4,26 @@ pragma solidity ^0.8.28;
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
- * @title W3CashProcessor — Design C authorization core (SKELETON, pre-audit)
+ * @title W3CashProcessor — Design C authorization core (PRE-AUDIT, in progress)
  * @notice Immutable, non-custodial, permissionless intent processor with
  *         root-granted, spend-capped, revocable SESSION KEYS for delegated AI-agent
- *         signing. Implements ADR-0001 Design C + Addendum C (2026-07-18 hardening).
+ *         signing. Implements ADR-0001 Design C + Addenda C/D.
  *
- * @dev THIS IS A SPEC SKELETON for review + audit scoping, NOT a deployable build.
- *      Every security-critical DECISION from the ADR is encoded concretely with the
- *      correct ordering: two-signature delegation, hash-bound typed Policy, GATE/ACTION
- *      op-kind boundary, rolling-window SOURCE-keyed spend reserve (reserve-before-every-
- *      pull, CEI), transient flash frame with zero-on-every-exit, three revocation tiers,
- *      ERC-1271 root, native pause-refund, clamp-and-meter tip. Points that depend on
- *      not-yet-frozen integration detail (Permit2 exact call, adapter funding mechanics,
- *      flash-pool wiring, delta reconciliation) are marked `NOTE(freeze):` — they carry
- *      placeholder logic so the skeleton compiles and the accounting is exercised.
+ * @dev Build status against ADR-0001 Addendum D (19-item plan):
+ *      DONE — two-signature delegation, hash-bound typed Policy, GATE/ACTION op-kind
+ *      boundary + adapter-kind belt-and-suspenders, rolling-window SOURCE-keyed spend
+ *      reserve (reserve-before-every-pull, CEI), the multi-mode funding descriptor,
+ *      Permit2/STANDING root pull + actual-delta metering, the SOLE-MOVER push-then-
+ *      measure adapter feed, THREADED frame draw + measured-output frame credit, three
+ *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip.
+ *      REMAINING (marked `NOTE(freeze):`) — the controlled-callback flash frame
+ *      (adapter-as-receiver + opsHash-bound sub-group, items 7); frame-sourced native
+ *      value (item 8); the on-chain hardening cluster (item 9); and the Permit2 WITNESS
+ *      typestring + per-chain golden vectors (item 12). NOT a deployable build yet.
  *
  * Invariants preserved from the substrate (see DECISIONS.md ADR-0001):
  *   (1) PAUSE→resume: a failed gate returns before ANY state write; re-submitting the
@@ -29,6 +33,12 @@ import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
  */
 contract W3CashProcessor is EIP712 {
     using ECDSA for bytes32;
+    using SafeERC20 for IERC20;
+
+    /// @notice Canonical Permit2 (ISignatureTransfer) — the ONLY permit-pull path. Immutable.
+    address public immutable permit2;
+    /// @dev THREADED fundAmount sentinel: draw the whole frame balance (UniversalRouter CONTRACT_BALANCE).
+    uint128 private constant CONTRACT_BALANCE = type(uint128).max;
 
     // ---------------------------------------------------------------------
     // Errors
@@ -85,6 +95,10 @@ contract W3CashProcessor is EIP712 {
     bytes32 private constant INTENT_TYPEHASH = keccak256(
         "Intent(bytes32 session,bytes32 opsHash,uint64 deadline,uint32 maxRuns,uint40 cooldown,uint256 epoch,bytes32 salt,address tipToken,uint128 tipAmount,address keeperOfRecord)"
     );
+    /// @dev Permit2 witness type string — binds the SignatureTransfer to the intent digest.
+    /// NOTE(freeze): frozen + covered by a per-chain golden vector before deploy (item 12).
+    string private constant WITNESS_TYPESTRING =
+        "bytes32 witness)TokenPermissions(address token,uint256 amount)";
 
     // ---------------------------------------------------------------------
     // Types
@@ -114,12 +128,14 @@ contract W3CashProcessor is EIP712 {
 
     struct Op {
         OpKind      kind;
-        address     target;     // adapter (codehash-pinned)
-        uint112     value;      // native forwarded (actions only)
-        FundingMode funding;    // NONE for gates
-        address     fundToken;  // token pulled/threaded (address(0)=native)
-        uint128     fundAmount; // declared upper bound (actual delta metered — NOTE)
-        bytes       data;       // adapter calldata
+        address     target;      // adapter (codehash-pinned)
+        uint112     value;       // native forwarded (actions only)
+        FundingMode funding;     // NONE for gates
+        address     fundToken;   // token pulled/threaded (address(0)=native)
+        uint128     fundAmount;  // input amount; == type(uint128).max + THREADED = draw-all (CONTRACT_BALANCE)
+        address     outToken;    // single output register the adapter returns to the processor
+        bytes       fundingParams; // PERMIT2: abi.encode(nonce,deadline,sig); else empty
+        bytes       data;        // adapter calldata
     }
 
     struct Intent {
@@ -167,7 +183,9 @@ contract W3CashProcessor is EIP712 {
     event TipPaid(bytes32 indexed intentDigest, address indexed to, address token, uint256 amount);
     event TipSkipped(bytes32 indexed intentDigest, bytes32 reason);
 
-    constructor() EIP712("W3Cash", "2") {}
+    constructor(address _permit2) EIP712("W3Cash", "2") {
+        permit2 = _permit2;
+    }
 
     receive() external payable {}
 
@@ -227,15 +245,14 @@ contract W3CashProcessor is EIP712 {
         unchecked { s.executions += 1; }
         s.lastExecuted = uint40(block.timestamp);
 
-        // 7. ACTIONS [boundary, len) — reserve-before-EVERY-pull, then run.
+        // 7. ACTIONS [boundary, len) — reserve-before-EVERY-pull, then SOLE-MOVER feed + run.
         uint256 forwarded;
         for (uint256 i = boundary; i < ops.length; ++i) {
             Op calldata op = ops[i];
-            _reserveAndFund(gDigest, policy, op, iDigest); // rolling-window, source-keyed, CEI
+            // Reserve (root-sourced) or draw (threaded) the input; returns the amount to push.
+            uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest);
             forwarded += op.value;
-            // NOTE(freeze): the processor feeds the adapter under SOLE-MOVER (no adapter-side
-            // transferFrom(root)); actions run processor-fed. Placeholder dispatch:
-            IActionAdapter(op.target).run{ value: op.value }(root, op.data);
+            _feedAndRun(op, root, fed); // push input to the adapter, run, credit measured output to the frame
         }
 
         // 8. RIDER-1 tip — clamp-and-meter against the DEDICATED tip sub-budget (Addendum C #8).
@@ -341,14 +358,18 @@ contract W3CashProcessor is EIP712 {
                 if (seenAction) revert OpsNotOrdered();          // GATE after ACTION => reject (never mid-seq)
                 if (_movesFunds(op)) revert GateMustNotMoveFunds();
                 if (!_codehashIn(p.gateCodehashes, op.target)) revert PolicyDenied();
-                // NOTE(freeze): belt-and-suspenders adapterKind()==KIND_GATE staticcall.
+                if (_adapterKind(op.target) != KIND_GATE) revert PolicyDenied(); // belt-and-suspenders (fail-closed)
             } else {
                 if (!seenAction) { seenAction = true; boundary = i; } // first ACTION marks the boundary
                 if (!_codehashIn(p.allowedCodehashes, op.target)) revert PolicyDenied();
+                if (_adapterKind(op.target) != KIND_ACTION) revert PolicyDenied();
                 if (_adapterVerb(op.target) & p.verbMask == 0) revert PolicyDenied(); // verb from adapter
-                // ROOT-sourced funded ops must name a capped token; THREADED ops draw the frame ledger.
+                // Root-sourced funded ops must name a capped token; a NONE-funded action must NOT name a
+                // fundToken (else it looks funded but is never reserved — an uncounted-pull footgun).
                 if (op.funding == FundingMode.PERMIT2 || op.funding == FundingMode.STANDING) {
                     if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
+                } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
+                    revert PolicyDenied();
                 }
                 if (op.value != 0 && _capIndex(p, address(0)) == NONE) revert TokenNotCapped(); // native cap (Addendum C #11)
             }
@@ -365,26 +386,86 @@ contract W3CashProcessor is EIP712 {
         catch { return 0; } // unknown => fail-closed (0 & mask == 0)
     }
 
+    /// @dev Self-declared adapter kind (belt-and-suspenders over the codehash-pin). Both
+    /// IGateAdapter and IActionAdapter share the adapterKind() selector. Fail-closed on absence.
+    function _adapterKind(address adapter) internal view returns (uint8) {
+        try IActionAdapter(adapter).adapterKind() returns (uint8 k) { return k; }
+        catch { return 0; }
+    }
+
     // ---------------------------------------------------------------------
     // Spend reserve — rolling-window, SOURCE-keyed, reserve-before-every-pull (CEI)
     // ---------------------------------------------------------------------
-    function _reserveAndFund(bytes32 gDigest, Policy calldata p, Op calldata op, bytes32 iDigest) internal {
+    /// @dev Provide the input for an ACTION op and return the amount now held by the processor and
+    /// ready to push to the adapter. THREADED draws the per-frame ledger (never counts vs the cap);
+    /// PERMIT2/STANDING reserve the cap BEFORE pulling root funds into the processor.
+    function _reserveAndFund(bytes32 gDigest, Policy calldata p, Op calldata op, address root, bytes32 iDigest)
+        internal
+        returns (uint256 fed)
+    {
         if (op.funding == FundingMode.THREADED) {
-            // Balance-threaded: draws ONLY the transient per-frame ledger; NEVER counts vs the cap.
-            uint256 avail = _frameGet(op.fundToken);
+            // SOURCE-keyed exemption: frame funds were already metered at the producing root op.
             if (_depth() < 1) revert ThreadedOutsideFrame();
-            if (avail < op.fundAmount) revert InsufficientFrameBalance();
-            _frameSet(op.fundToken, avail - op.fundAmount);
-            // NOTE(freeze): thread funds to the adapter from processor-held frame balance.
-            return;
+            uint256 avail = _frameGet(op.fundToken);
+            uint256 draw = op.fundAmount == CONTRACT_BALANCE ? avail : op.fundAmount; // draw-all sentinel
+            if (avail < draw) revert InsufficientFrameBalance();
+            _frameSet(op.fundToken, avail - draw);
+            return draw;
         }
-        if (op.funding == FundingMode.NONE) return; // e.g. pure-native op already value-capped in shape check
+        if (op.funding == FundingMode.NONE) return 0; // pure-native / no-input op
 
-        // ROOT-sourced (PERMIT2 / STANDING): reserve against the cap RIGHT BEFORE the pull.
+        // ROOT-sourced: reserve the cap (upper bound) RIGHT BEFORE the pull, then pull into self.
         _reserveCap(gDigest, p, op.fundToken, op.fundAmount, iDigest);
-        // NOTE(freeze): perform the actual root pull here (Permit2 SignatureTransfer or standing
-        // allowance) INTO the adapter/processor, then reconcile the reserve to the MEASURED root
-        // outflow delta (Addendum C #6, FoT-safe): re-book spent to (balanceBefore-balanceAfter).
+        fed = _pullRoot(op, root, iDigest); // measured received (FoT-safe): push exactly what arrived
+    }
+
+    /// @dev Pull `fundAmount` of `fundToken` from `root` INTO the processor and return the MEASURED
+    /// received amount. STANDING = a standing approve-to-processor allowance; PERMIT2 = a witness-
+    /// bound SignatureTransfer (processor is the sole spender). The adapter never pulls from root.
+    function _pullRoot(Op calldata op, address root, bytes32 iDigest) internal returns (uint256 received) {
+        IERC20 t = IERC20(op.fundToken);
+        uint256 balBefore = t.balanceOf(address(this));
+        if (op.funding == FundingMode.STANDING) {
+            t.safeTransferFrom(root, address(this), op.fundAmount);
+        } else {
+            _permit2Pull(op, root, iDigest);
+        }
+        received = t.balanceOf(address(this)) - balBefore; // FoT-safe
+    }
+
+    /// @dev Witness-bound Permit2 SignatureTransfer, witness = the intent digest (binds the pull to
+    /// THIS intent). fundingParams = abi.encode(nonce, deadline, signature).
+    /// NOTE(freeze): the exact WITNESS_TYPESTRING is a per-chain release-gate golden vector (item 12).
+    function _permit2Pull(Op calldata op, address root, bytes32 iDigest) internal {
+        (uint256 nonce, uint256 deadline, bytes memory sig) =
+            abi.decode(op.fundingParams, (uint256, uint256, bytes));
+        ISignatureTransfer(permit2).permitWitnessTransferFrom(
+            ISignatureTransfer.PermitTransferFrom({
+                permitted: ISignatureTransfer.TokenPermissions({ token: op.fundToken, amount: op.fundAmount }),
+                nonce: nonce,
+                deadline: deadline
+            }),
+            ISignatureTransfer.SignatureTransferDetails({ to: address(this), requestedAmount: op.fundAmount }),
+            root,
+            iDigest, // witness
+            WITNESS_TYPESTRING,
+            sig
+        );
+    }
+
+    /// @dev Push the fed input to the codehash-pinned adapter, run it, and credit the MEASURED output
+    /// delta to the frame ledger for downstream THREADED ops. SOLE-MOVER: the adapter is a pure
+    /// function of pushed tokens + value + data and cannot reach root funds.
+    function _feedAndRun(Op calldata op, address root, uint256 fed) internal {
+        if (op.fundToken != address(0) && fed > 0) {
+            IERC20(op.fundToken).safeTransfer(op.target, fed);
+        }
+        uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+        IActionAdapter(op.target).run{ value: op.value }(root, op.data);
+        if (op.outToken != address(0)) {
+            uint256 outAfter = IERC20(op.outToken).balanceOf(address(this));
+            if (outAfter > outBefore) _frameCredit(op.outToken, outAfter - outBefore);
+        }
     }
 
     function _reserveCap(bytes32 gDigest, Policy calldata p, address token, uint256 amount, bytes32 iDigest) internal {
@@ -531,4 +612,20 @@ interface IActionAdapter {
     function adapterKind() external view returns (uint8); // KIND_ACTION
     function verb() external view returns (uint32);       // declared verb bitmask
     function run(address initiator, bytes calldata data) external payable returns (bytes memory);
+}
+
+/// @notice Uniswap Permit2 SignatureTransfer subset — the processor's only permit-pull path.
+interface ISignatureTransfer {
+    struct TokenPermissions { address token; uint256 amount; }
+    struct PermitTransferFrom { TokenPermissions permitted; uint256 nonce; uint256 deadline; }
+    struct SignatureTransferDetails { address to; uint256 requestedAmount; }
+
+    function permitWitnessTransferFrom(
+        PermitTransferFrom calldata permit,
+        SignatureTransferDetails calldata transferDetails,
+        address owner,
+        bytes32 witness,
+        string calldata witnessTypeString,
+        bytes calldata signature
+    ) external;
 }
