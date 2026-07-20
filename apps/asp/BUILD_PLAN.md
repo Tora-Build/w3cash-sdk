@@ -230,3 +230,61 @@ The submitted OKX demo, the live `asp.w3.cash` service, and the current
 contracts stay exactly as they are until *we* choose to point the compiler at new
 addresses — which is a deliberate, separate step, not a side effect of any of the
 above.
+
+---
+
+## Completion plan (ADR-0001 Addendum D — 19 items, sequenced)
+
+From the 2026-07-19 intent-system study + design + critique workflow. `[on]` = the
+immutable-contract redeploy target; `[off]` = ships on the current deployment.
+
+**On-chain — complete the canonical `W3CashProcessor` (the Design C target):**
+1. `[on]` **Rename** `W3CashProcessorV2` → canonical `W3CashProcessor` (old nonce-based
+   one → `…Legacy`, deprecated). Do first so all stub work lands on the canonical name.
+2. `[on]` **Funding descriptor + Op struct**: add `outToken` (one committed output
+   register — not a Weiroll VM) + `bytes fundingParams`; freeze the 4-mode
+   `FundingMode` enum + Permit2/WITNESS constants. Modes are **frozen at 4**.
+3. `[on]` **`_reserveAndFund`** — root-sourced pull (Permit2 `permitWitnessTransferFrom`
+   witness=iDigest / `AllowanceTransfer`) **reserve-before-pull**; actual-delta metering
+   (FoT-safe frame credit).
+4. `[on]` **`_feedAndRun`** — push-then-measure SOLE-MOVER feed: `safeTransfer` to the
+   codehash-pinned adapter, snapshot `outToken`, `run{value}(root,data)`, `_frameCredit`
+   the measured delta. First-word return demoted to a sanity assert.
+5. `[on]` **THREADED draw + unified `_frameCredit` funnel** (+ `CONTRACT_BALANCE`
+   sentinel); resolve the pull-to-self double-book (one feeder discipline).
+6. `[on]` **Fleet interface + codehash-pin + bytecode-vetting scan** — `IActionAdapter`/
+   `IGateAdapter`; SOLE-MOVER is a fleet CODE invariant (no `transferFrom(from!=self)`,
+   no delegatecall/selfdestruct in a pinned adapter), enforced by the vetting scan.
+7. `[on]` **Flash frame — adapter-as-receiver + opsHash-bound sub-group** (fixes F1+F2).
+   Delete the shipped FlashLoanAdapter's arbitrary `target.call` + full-principal root
+   repay; exclude it until rewritten.
+8. `[on]` **Native-ETH conservation fix** — allow frame-sourced native (unwrap→send-ETH),
+   pick one native-cap semantic + a golden vector.
+9. `[on]` **On-chain hardening cluster** — reject PERMIT2 on `maxRuns!=1`; `MIN_RESET`
+   floor on `resetPeriod`; `cancelIntent` authorizes via full grant; ERC-7739 nested-712
+   for the 1271 root branch (reject legacy `0x20c13b0b`); domain version `"2"` everywhere.
+10. `[on]` **Tip mechanics** — `_payTipMetered` (dedicated sub-budget, gas-capped, best-
+    effort); minimal `TipTerms{tipToken,maxTip,keeperOfRecord}`; default protective
+    recipes to open bounty.
+11. `[on]` **`PostConditionAdapter` as an ACTION verb** (`VERB_ASSERT`) — post-action
+    slippage/MEV revert (a gate can't sit after actions).
+12. `[off]` **Formal-proof obligations + per-chain golden vectors** — the three
+    flash-frame proofs + Permit2/7739/native/tip/reentrancy release-gate vectors.
+
+**Off-chain — Phase-1 suite (ships now):**
+13. `[off]` Encoder safe-by-default (✅ partly done) + rebasing allowlist + dedicated
+    one-shot Permit2 nonce + never emit a root→adapter approval.
+14. `[off]` **`w3cash_simulate_intent`** — FREE static-read + `eth_call` dry-run,
+    **verdict-only (no payload leak)**; honest fidelity split (no pre-sign Permit2 claim).
+15. `[off]` **Fix the free/paid x402 ladder** — gate ops/`toSign` behind paid compile.
+16. `[off]` **Dynamic payment** — multi-`accepts[]` from the ChainRegistry, pinned
+    `payChain` (membership-closed), default-with-disclosure (echo settled chain),
+    **fail-hard not FREE** when all facilitators down, consumed-`(nonce,network)` tracking.
+17. `[off]` **Intent status + neutral telemetry** — CF Workers cron-indexer over chain
+    events (84532/1952), reliability stats from a reproducible on-chain denominator.
+18. `[off]` **Compile-time sanity layer** — threshold/decimal lint + swap/bridge autoQuote.
+19. `[off]` **Distribution** — ERC-8004 self-registration + AgentCard + per-vertical skills.
+
+**Residual pre-freeze open items:** the three flash-frame formal proofs; the `MIN_RESET`
+floor value; op-encoding byte-headroom for `outToken`+`fundingParams`; recurring
+cross-chain bridge quote-staleness (one-shot only for now).

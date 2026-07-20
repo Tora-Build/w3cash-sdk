@@ -813,3 +813,84 @@ composition] → hardened-design synthesis → 5-lens adversarial critique panel
 [reentrancy/CEI, signature/replay/domain, policy-decoder, economic/griefing,
 invariant-preservation] → synthesis. 12 agents, 0 errors. Ground-truth read against
 `W3CashProcessor.sol`, `QueryAdapter.sol`, the shipped adapter fleet.)_
+
+---
+
+## ADR-0001 — Addendum D: completing the processor (intent-system synthesis)
+
+- **Status:** Accepted (design) — turns the Design C **skeleton** into a complete,
+  audit-ready design by filling every `NOTE(freeze)` stub with a sourced pattern.
+  The ordered build list is in `apps/asp/BUILD_PLAN.md` (19 items).
+- **Date:** 2026-07-19
+- **Verdict:** **Sound enough to implement-then-audit — with two mandatory
+  flash-frame rethinks before freeze.** The auth core (session keys + per-token
+  caps + typed policy over the per-intent cursor) and all four invariants survived
+  all five adversarial lenses. The funding/spend-cap core is correct.
+
+### What we BORROW (and why it fits the local / non-counterparty / immutable model)
+
+- **Uniswap Permit2** — `permitWitnessTransferFrom` (witness = the intent digest)
+  for one-shot root pulls; `AllowanceTransfer` for recurring. The processor is the
+  **sole Permit2 spender** — that spender-binding, not the codehash-pin, is the true
+  structural stop on a dishonest adapter reaching root funds.
+- **Seaport Conduit / Uniswap UniversalRouter** — "the contract holds the funds and
+  **pushes** exactly what each op needs" (SOLE-MOVER feed) + balance-delta accounting
+  + the `CONTRACT_BALANCE` draw-all sentinel. An adapter is a pure function of pushed
+  tokens+value+data and **physically cannot** `transferFrom(root)`.
+- **Aave / Uniswap flash callback** — atomic borrow-and-repay, redesigned as a
+  **controlled callback** (adapter-as-receiver, never counterparty fill).
+- **Across `depositV3`** — a **fire-and-forget** outbound bridge ACTION: the source
+  deposit succeeds → the op is done, the intent never enters an "awaiting-fill" state,
+  so it stays atomic + PAUSE→resume-safe. The cap bounds **source outflow only**
+  (destination delivery is Across's guarantee, structurally unenforceable on-chain).
+- **ERC-7683 field/envelope SHAPES** — `ResolvedCrossChainOrder` shape for the
+  **off-chain** `W3CashResolver`/simulate preview; `FillInstruction`/MulticallHandler
+  shape for the C2 destination envelope (a full sub-intent signed for the destination
+  domain, opaque to the source). Shapes only — never on-chain enforcement.
+- **CoW/1inch Fusion** — the *fee-on-fill economics concept* for the RIDER-1 tip
+  (payee routing), **not** the order-book struct fields.
+
+### What we REJECT (imports mutability or a counterparty the model forbids)
+
+ERC-7683 `open()/openFor` gasless orders + the whole solver-fill/settlement model (a
+filler pulls root funds → breaks SOLE-MOVER); batch auctions / coincidence-of-wants /
+Dutch-decay (no counterparty); ERC-4337 bundler dependency; a Weiroll **delegatecall**
+register VM (keep ONE committed output register — `outToken` — not a VM); upgradeable
+module assumptions (Safe modules borrowed for shape, not for mutability); in-processor
+cross-chain routing (the processor stays a pure local interpreter; cross-chain lives in
+the codehash-pinned adapter + opaque message).
+
+### The two mandatory pre-freeze flash-frame fixes (found by the critique panel)
+
+- **F1 — codehash-only pool auth + pool-echoed sub-ops let an injected sub-group
+  redirect remaining capped spend.** Fix: bind the flash sub-group's calldata to the
+  signed `it.opsHash`, and pin the expected callback address in a **transient**
+  slot at dispatch (not just a codehash set), so a same-codehash pool/adapter can't
+  inject attacker sub-ops. Every sub-op routes through `_reserveAndFund`
+  (reserve-before-pull), explicit.
+- **F2 — a pool-as-caller auth cannot hold on an immutable contract.** Fix: the only
+  viable topology is **adapter-as-receiver** — the immutable processor holds NO
+  pool-specific ABI; all pool wiring lives in the redeployable flash adapter, which
+  forwards principal to the processor and repays the pool; never `transferFrom(root)`.
+
+Plus: the skeleton's `msg.value`-conservation check **bricks native threading**
+(unwrap→send-ETH) forever — must allow frame-sourced native (item 8). **SOLE-MOVER is
+a fleet-wide CODE invariant** enforced by a bytecode-vetting scan (no
+`transferFrom(from != self)`, no `DELEGATECALL`/`SELFDESTRUCT` in a pinned adapter),
+**not** a processor-level structural property. Funding modes are **frozen at 4** —
+a new funding *source* needs a redeploy (`fundingParams` only adds parameter headroom).
+
+### Off-chain pre-ship fixes (from the panel)
+
+The **free tier must not leak the executable payload** (return verdict-only; gate the
+compiled ops/`toSign` behind the paid compile, or invert the ladder). `simulate` **must
+not claim pre-sign Permit2-pull validation** it structurally cannot do (an `eth_call`
+before signing can't exercise `permitWitnessTransferFrom` — no sig). The dynamic
+payment must **fail-hard (503), never degrade to FREE**, when all advertised chains'
+facilitators are down, and track consumed `(nonce, network)` to close the verify/settle gap.
+
+_Source: multi-agent intent-system study + design + adversarial-critique workflow,
+2026-07-19 (6-angle research [Across/ERC-7683, Safe modules, CoW/Fusion/UniswapX,
+Enso/Weiroll/UniversalRouter, Permit2/EIP-3009/AA, + our own skeleton] → complete-design
+synthesis → 5-lens critique [reentrancy/flash, funding/cap, wrong-idea-imported,
+invariants/immutability, phase-1/dynamic-payment] → final plan. 13 agents, 0 errors.)_
