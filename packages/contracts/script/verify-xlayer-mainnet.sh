@@ -26,7 +26,7 @@ verify() { # <address> <path:name> <ctor-arg-address>
 
 # registry(initialOwner=deployer); processor(registry); each adapter(processor)
 verify "$REGISTRY"                                     src/w3cash/AdapterRegistry.sol:AdapterRegistry     "$DEPLOYER"
-verify "$PROCESSOR"                                    src/w3cash/W3CashProcessor.sol:W3CashProcessor     "$REGISTRY"
+verify "$PROCESSOR"                                    src/w3cash/W3CashProcessorLegacy.sol:W3CashProcessorLegacy     "$REGISTRY"
 verify 0xbc7b155057Bb78BB8bF9c9F9Fa6bFCc931aEAF38      src/w3cash/adapters/TransferAdapter.sol:TransferAdapter   "$PROCESSOR"
 verify 0x1aF3cB8B270Db3e71fC979543c32B87709EA191f      src/w3cash/adapters/ApproveAdapter.sol:ApproveAdapter     "$PROCESSOR"
 verify 0x8629b9ca457F4088ec8346FAED61DA858FDB498d      src/w3cash/adapters/WaitAdapter.sol:WaitAdapter           "$PROCESSOR"

@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import { Script, console } from "forge-std/Script.sol";
 import { AdapterRegistry } from "../src/w3cash/AdapterRegistry.sol";
-import { W3CashProcessor } from "../src/w3cash/W3CashProcessor.sol";
+import { W3CashProcessorLegacy } from "../src/w3cash/W3CashProcessorLegacy.sol";
 import { WaitAdapter } from "../src/w3cash/adapters/WaitAdapter.sol";
 import { QueryAdapter } from "../src/w3cash/adapters/QueryAdapter.sol";
 import { AaveAdapter } from "../src/w3cash/adapters/AaveAdapter.sol";
@@ -14,14 +14,14 @@ import { AaveAdapter } from "../src/w3cash/adapters/AaveAdapter.sol";
  *
  * Deployment Order:
  * 1. Deploy AdapterRegistry (upgradeable, owned)
- * 2. Deploy W3CashProcessor with registry reference (immutable)
+ * 2. Deploy W3CashProcessorLegacy with registry reference (immutable)
  * 3. Deploy adapters with processor reference (onlyProcessor guard)
  * 4. Register adapters in registry
  * 5. Set chain mappings
  * 6. (Optional) Freeze production adapters
  *
  * Trust Model:
- * - W3CashProcessor: TRUSTLESS (immutable, no admin)
+ * - W3CashProcessorLegacy: TRUSTLESS (immutable, no admin)
  * - AdapterRegistry: Admin-controlled until adapters are frozen
  * - Adapters: Locked to processor via onlyProcessor guard
  */
@@ -51,9 +51,9 @@ contract DeployW3Cash is Script {
         AdapterRegistry registry = new AdapterRegistry(deployer);
         console.log("AdapterRegistry deployed at:", address(registry));
 
-        // 2. Deploy W3CashProcessor (immutable, references registry)
-        W3CashProcessor processor = new W3CashProcessor(address(registry));
-        console.log("W3CashProcessor deployed at:", address(processor));
+        // 2. Deploy W3CashProcessorLegacy (immutable, references registry)
+        W3CashProcessorLegacy processor = new W3CashProcessorLegacy(address(registry));
+        console.log("W3CashProcessorLegacy deployed at:", address(processor));
 
         // 3. Deploy adapters (with processor address for onlyProcessor guard)
         WaitAdapter waitAdapter = new WaitAdapter(address(processor));
@@ -84,7 +84,7 @@ contract DeployW3Cash is Script {
         console.log("WaitAdapter:", address(waitAdapter));
         console.log("QueryAdapter:", address(queryAdapter));
         console.log("AaveAdapter:", address(aaveAdapter));
-        console.log("W3CashProcessor:", address(processor));
+        console.log("W3CashProcessorLegacy:", address(processor));
         console.log("");
         console.log("Next steps:");
         console.log("1. Test the deployment on testnet");

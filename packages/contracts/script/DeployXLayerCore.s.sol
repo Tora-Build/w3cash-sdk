@@ -3,7 +3,7 @@ pragma solidity ^0.8.13;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {AdapterRegistry} from "../src/w3cash/AdapterRegistry.sol";
-import {W3CashProcessor} from "../src/w3cash/W3CashProcessor.sol";
+import {W3CashProcessorLegacy} from "../src/w3cash/W3CashProcessorLegacy.sol";
 import {TransferAdapter} from "../src/w3cash/adapters/TransferAdapter.sol";
 import {ApproveAdapter} from "../src/w3cash/adapters/ApproveAdapter.sol";
 import {WaitAdapter} from "../src/w3cash/adapters/WaitAdapter.sol";
@@ -22,7 +22,7 @@ contract DeployXLayerCore is Script {
 
         vm.startBroadcast(pk);
         AdapterRegistry registry = new AdapterRegistry(deployer);
-        W3CashProcessor processor = new W3CashProcessor(address(registry));
+        W3CashProcessorLegacy processor = new W3CashProcessorLegacy(address(registry));
         address p = address(processor);
 
         TransferAdapter transferA = new TransferAdapter(p);
