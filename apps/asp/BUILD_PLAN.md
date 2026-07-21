@@ -277,9 +277,11 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
 14. `[off]` **`w3cash_simulate_intent`** — FREE static-read + `eth_call` dry-run,
     **verdict-only (no payload leak)**; honest fidelity split (no pre-sign Permit2 claim).
 15. `[off]` **Fix the free/paid x402 ladder** — gate ops/`toSign` behind paid compile.
-16. `[off]` **Dynamic payment** — multi-`accepts[]` from the ChainRegistry, pinned
-    `payChain` (membership-closed), default-with-disclosure (echo settled chain),
-    **fail-hard not FREE** when all facilitators down, consumed-`(nonce,network)` tracking.
+16. `[off]` **Dynamic payment** ✅ — multi-`accepts[]` (primary `NETWORK` + `PAYMENT_NETWORKS`,
+    sanitized/de-duped, default first), `GET /payment-options` + `w3cash_payment_options` MCP
+    tool (disclosure of chains + default), and `X-Payment-Network` echo on the paid response.
+    *(Deferred: fail-hard-not-FREE on total facilitator outage + consumed-`(nonce,network)`
+    tracking — kept fail-open-to-FREE for uptime; revisit with the ladder in item 15.)*
 17. `[off]` **Intent status + neutral telemetry** — CF Workers cron-indexer over chain
     events (84532/1952), reliability stats from a reproducible on-chain denominator.
 18. `[off]` **Compile-time sanity layer** — threshold/decimal lint + swap/bridge autoQuote.

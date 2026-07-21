@@ -1,14 +1,22 @@
 /**
- * x402 pay-per-call gate (phase-2) for POST /compile-intent, via the OKX Payment
- * SDK. Non-invasive: returns an Express middleware only when explicitly enabled
- * and fully configured; otherwise the endpoint stays FREE (returns null).
+ * x402 pay-per-call gate (phase-2) for /compile-intent, via the OKX Payment SDK.
+ * Non-invasive: returns an Express middleware only when explicitly enabled and
+ * fully configured; otherwise the endpoint stays FREE (returns null).
  *
- * Enable with:  X402_ENABLED=true  + NETWORK (CAIP-2) + PAY_TO_ADDRESS + OKX_* creds.
- * Settlement is USD₮0 on X Layer (testnet eip155:1952, mainnet eip155:196).
+ * DYNAMIC PAYMENT (Phase-1 item 16): the 402 challenge advertises EVERY configured
+ * settlement chain in `accepts[]`, so the caller's x402 client picks one (interactive).
+ * A caller with no preference pays the DEFAULT (the first / primary network); the
+ * chosen network is disclosed back on the paid response via `X-Payment-Network`, and
+ * the full option list is served at `GET /payment-options`. Settlement is a stablecoin
+ * per chain (e.g. USD₮0 on X Layer mainnet eip155:196, USDC on Base) resolved by the
+ * OKX facilitator from the price.
+ *
+ * Enable with:  X402_ENABLED=true + NETWORK (primary CAIP-2) + PAY_TO_ADDRESS + OKX_* creds.
+ * Add more chains with PAYMENT_NETWORKS (comma-separated CAIP-2; same payTo + price).
  *
  * The OKX packages are imported dynamically so free-mode boot never loads them.
  */
-import type { RequestHandler } from "express";
+import type { RequestHandler, Request, Response, NextFunction } from "express";
 
 export interface PaymentConfig {
   network?: string;
@@ -16,7 +24,109 @@ export interface PaymentConfig {
   okxApiKey?: string;
   okxSecretKey?: string;
   okxPassphrase?: string;
+  /** Extra settlement chains beyond `network` (comma-separated CAIP-2). */
+  extraNetworks?: string;
 }
+
+type Caip2 = `${string}:${string}`;
+
+/** Display-only asset labels per chain (the facilitator resolves the real asset from price). */
+const KNOWN_ASSET: Record<string, string> = {
+  "eip155:196": "USD₮0",
+  "eip155:1952": "USD₮0",
+  "eip155:8453": "USDC",
+  "eip155:84532": "USDC",
+};
+
+/**
+ * Sanitize + validate a CAIP-2 network id. A stray inline comment or whitespace in an
+ * env value (e.g. "eip155:196 # note") reaches the facilitator as a malformed network
+ * and throws — which previously escaped as an unhandled rejection and CRASHED the boot.
+ * Cut at the first whitespace/# and require the CAIP-2 shape; return null if invalid.
+ */
+function sanitizeNetwork(raw: string | undefined): Caip2 | null {
+  if (!raw) return null;
+  const net = raw.trim().split(/[\s#]/)[0].trim(); // trim FIRST so a leading space isn't cut to ""
+  if (!/^[a-z0-9]+:[a-zA-Z0-9]+$/.test(net)) return null;
+  return net as Caip2;
+}
+
+/**
+ * Resolve the ordered, de-duplicated list of settlement networks (default = first).
+ * The primary `network` leads; `PAYMENT_NETWORKS` (or cfg.extraNetworks) appends more.
+ */
+export function resolvePaymentNetworks(cfg: PaymentConfig): Caip2[] {
+  const out: Caip2[] = [];
+  const push = (raw: string | undefined) => {
+    const net = sanitizeNetwork(raw);
+    if (net && !out.includes(net)) out.push(net);
+  };
+  push(cfg.network);
+  const extra = cfg.extraNetworks ?? process.env.PAYMENT_NETWORKS;
+  if (extra) for (const part of extra.split(",")) push(part);
+  return out;
+}
+
+export interface PaymentOption {
+  readonly network: Caip2;
+  readonly asset: string; // display label; facilitator resolves the concrete token
+  readonly payTo: string;
+  readonly price: string;
+  readonly isDefault: boolean;
+}
+
+export interface PaymentOptions {
+  readonly enabled: boolean;
+  readonly default: Caip2 | null;
+  readonly options: readonly PaymentOption[];
+  readonly note: string;
+}
+
+/** The payment options for `GET /payment-options` (disclosure of chains + default). */
+export function getPaymentOptions(
+  cfg: PaymentConfig,
+  price: string = process.env.X402_PRICE ?? "$0.01"
+): PaymentOptions {
+  const enabled = process.env.X402_ENABLED === "true";
+  const nets = resolvePaymentNetworks(cfg);
+  const payTo = cfg.payTo ?? "";
+  const options = nets.map((network, i) => ({
+    network,
+    asset: KNOWN_ASSET[network] ?? "stablecoin",
+    payTo,
+    price,
+    isDefault: i === 0,
+  }));
+  return {
+    enabled: enabled && options.length > 0 && payTo !== "",
+    default: nets[0] ?? null,
+    options,
+    note:
+      "The 402 challenge advertises all of these; your x402 client picks one, or omits a preference to pay the default. The chosen chain is echoed on the paid response as X-Payment-Network.",
+  };
+}
+
+/** Decode the caller's X-PAYMENT request header (base64 JSON) to the network they paid on. */
+function paidNetworkFromRequest(req: Request): string | null {
+  try {
+    const h = req.headers["x-payment"];
+    const raw = Array.isArray(h) ? h[0] : h;
+    if (!raw) return null;
+    const decoded = JSON.parse(Buffer.from(raw, "base64").toString("utf8")) as {
+      network?: string;
+    };
+    return typeof decoded.network === "string" ? decoded.network : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort disclosure: echo the settled network on the response. Never throws. */
+const disclosureMiddleware: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const net = paidNetworkFromRequest(req);
+  if (net) res.setHeader("X-Payment-Network", net);
+  next();
+};
 
 /** Build the x402 middleware, or null when payments are disabled/misconfigured. */
 export async function buildX402Middleware(
@@ -25,23 +135,11 @@ export async function buildX402Middleware(
 ): Promise<RequestHandler | null> {
   if (process.env.X402_ENABLED !== "true") return null;
 
-  const { network, payTo, okxApiKey, okxSecretKey, okxPassphrase } = cfg;
-  if (!network || !payTo || !okxApiKey || !okxSecretKey || !okxPassphrase) {
+  const { payTo, okxApiKey, okxSecretKey, okxPassphrase } = cfg;
+  const networks = resolvePaymentNetworks(cfg);
+  if (networks.length === 0 || !payTo || !okxApiKey || !okxSecretKey || !okxPassphrase) {
     console.warn(
-      "[x402] X402_ENABLED=true but NETWORK / PAY_TO_ADDRESS / OKX_* are incomplete — staying FREE."
-    );
-    return null;
-  }
-  // The SDK types network as CAIP-2 (`namespace:reference`, e.g. "eip155:1952").
-  // HARDENING: sanitize + validate before touching the SDK. A stray inline
-  // comment or whitespace in the env value (e.g. "eip155:1952 # note") reaches
-  // the facilitator as a malformed network and throws RouteConfigurationError —
-  // which previously escaped as an unhandled rejection and CRASHED the boot.
-  // Cut at the first whitespace/# and require the CAIP-2 shape; otherwise stay FREE.
-  const net = network.split(/[\s#]/)[0].trim() as `${string}:${string}`;
-  if (!/^[a-z0-9]+:[a-zA-Z0-9]+$/.test(net)) {
-    console.warn(
-      `[x402] NETWORK "${network}" is not a valid CAIP-2 id (parsed "${net}") — staying FREE.`
+      "[x402] X402_ENABLED=true but NETWORK / PAY_TO_ADDRESS / OKX_* are incomplete or no valid CAIP-2 network — staying FREE."
     );
     return null;
   }
@@ -57,32 +155,53 @@ export async function buildX402Middleware(
       passphrase: okxPassphrase,
     });
     const resourceServer = new x402ResourceServer(facilitatorClient);
-    resourceServer.register(net, new ExactEvmScheme());
+    // Register the exact scheme for EACH advertised network.
+    for (const net of networks) resourceServer.register(net, new ExactEvmScheme());
 
-    // Eagerly initialize (calls the OKX facilitator's getSupported) INSIDE this
-    // try, so bad creds / an unreachable facilitator fail-open to FREE here
-    // rather than crashing later as an unhandled rejection inside the middleware.
+    // Eagerly initialize (calls the OKX facilitator's getSupported) INSIDE this try so
+    // bad creds / an unreachable facilitator fail-open to FREE here rather than crashing
+    // later as an unhandled rejection inside the middleware.
     const initable = resourceServer as unknown as { initialize?: () => Promise<unknown> };
     if (typeof initable.initialize === "function") {
       await initable.initialize();
     }
 
-    console.log(`[x402] payments ENABLED — POST /compile-intent, ${price} on ${network} → ${payTo}`);
+    console.log(
+      `[x402] payments ENABLED — /compile-intent, ${price} → ${payTo} on [${networks.join(
+        ", "
+      )}] (default ${networks[0]})`
+    );
 
-    // Gate both POST (the real call) and GET (so OKX's `curl -i` self-check on the
-    // registered endpoint returns the 402 challenge regardless of method).
+    // Multi-chain accepts[]: one entry per configured network. The x402 client chooses
+    // one (or the default). Gate both POST (the real call) and GET (OKX's curl self-check).
+    const accepts = networks.map((network) => ({
+      scheme: "exact",
+      network,
+      payTo,
+      price,
+    }));
     const paidRoute = {
-      accepts: [{ scheme: "exact", network: net, payTo, price }],
+      accepts,
       description: "W3Cash Intent Compiler — compile a signable on-chain intent",
       mimeType: "application/json",
     };
-    return paymentMiddleware(
+    const paymentGate = paymentMiddleware(
       {
         "POST /compile-intent": paidRoute,
         "GET /compile-intent": paidRoute,
       },
       resourceServer
     );
+
+    // Chain the disclosure wrapper AFTER the payment gate so a settled request echoes
+    // X-Payment-Network. Both are no-ops on non-/compile-intent routes.
+    const composed: RequestHandler = (req, res, next) => {
+      paymentGate(req, res, (err?: unknown) => {
+        if (err) return next(err as Error);
+        disclosureMiddleware(req, res, next);
+      });
+    };
+    return composed;
   } catch (e) {
     // Never let a payment misconfig take down the endpoint — fall back to FREE.
     console.error(

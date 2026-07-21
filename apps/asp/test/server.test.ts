@@ -255,6 +255,22 @@ describe("POST /compile-intent — happy path", () => {
   });
 });
 
+describe("GET /payment-options (dynamic payment disclosure)", () => {
+  it("returns the settlement chains + default (free-mode: disabled, empty)", async () => {
+    const res = await fetch(base + "/payment-options");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      payment: { enabled: boolean; default: string | null; options: unknown[]; note: string };
+    };
+    expect(body.ok).toBe(true);
+    // Tests run without X402_ENABLED/NETWORK, so payments are disabled and options empty.
+    expect(body.payment.enabled).toBe(false);
+    expect(Array.isArray(body.payment.options)).toBe(true);
+    expect(typeof body.payment.note).toBe("string");
+  });
+});
+
 describe("POST /compile-intent — validation 400s", () => {
   it("rejects an empty intent", async () => {
     const { status, body } = await postJson("/compile-intent", {});

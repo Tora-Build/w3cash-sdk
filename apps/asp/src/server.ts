@@ -17,7 +17,7 @@ import {
   MAX_STEPS,
   type CompileRequest,
 } from "./w3cash/encode.js";
-import { buildX402Middleware } from "./x402.js";
+import { buildX402Middleware, getPaymentOptions } from "./x402.js";
 import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
 import { LANDING_HTML } from "./landing.js";
 
@@ -80,6 +80,7 @@ const paymentConfig = {
   okxApiKey: process.env.OKX_API_KEY,
   okxSecretKey: process.env.OKX_SECRET_KEY,
   okxPassphrase: process.env.OKX_PASSPHRASE,
+  extraNetworks: process.env.PAYMENT_NETWORKS,
 } as const;
 
 // x402 pay-per-call gate (phase-2). Returns null in free mode (default), or an
@@ -88,6 +89,12 @@ const paymentConfig = {
 // through free. Top-level await is fine here (ESM); free mode resolves instantly.
 const x402Middleware = await buildX402Middleware(paymentConfig);
 if (x402Middleware) app.use(x402Middleware);
+
+// Payment disclosure: the settlement chains advertised in the 402 challenge + the
+// default, so a caller can see where it will pay before paying (dynamic payment).
+app.get("/payment-options", (_req: Request, res: Response) => {
+  res.status(200).json({ ok: true, payment: getPaymentOptions(paymentConfig) });
+});
 
 // Landing page at the root — a read-only, self-contained visual of the live
 // service (renders /capabilities prettily). Static HTML; no wallet/execution.

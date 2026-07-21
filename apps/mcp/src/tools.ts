@@ -202,6 +202,27 @@ export function registerTools(server: McpServer): void {
   );
 
   // -------------------------------------------------------------------------
+  // 6. Payment options — which chains the compile fee can be paid on.
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "w3cash_payment_options",
+    {
+      title: "W3Cash: list payment (x402) options",
+      description:
+        "List the settlement chains the paid compile fee can be paid on, and which is the DEFAULT. " +
+        "The x402 402-challenge advertises ALL of these; your payer picks one, or omits a preference " +
+        "to pay the default — and the paid response echoes which chain settled (X-Payment-Network). " +
+        "Use this to show the user their payment choices before compiling, or to confirm where a " +
+        "compile fee will settle. Each option is a { network (CAIP-2), asset, payTo, price, isDefault }. " +
+        "Note: this is about the FEE to USE the compiler (a stablecoin like USD₮0 on X Layer mainnet), " +
+        "NOT the chain the compiled intent executes on (that is the `chain` arg on the other tools).",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async () => present(await aspGet(`/payment-options`)),
+  );
+
+  // -------------------------------------------------------------------------
   // 3. Bridge quote — live Across quote for a cross-chain `bridge` action.
   // -------------------------------------------------------------------------
   server.registerTool(
