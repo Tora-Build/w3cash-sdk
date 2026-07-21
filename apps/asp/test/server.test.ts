@@ -258,6 +258,30 @@ describe("POST /compile-intent — happy path", () => {
   });
 });
 
+describe("GET /agent-card (discovery)", () => {
+  it("serves a well-formed AgentCard at both paths", async () => {
+    for (const path of ["/agent-card", "/.well-known/agent-card.json"]) {
+      const res = await fetch(base + path);
+      expect(res.status).toBe(200);
+      const card = (await res.json()) as {
+        protocol: string;
+        name: string;
+        custody: string;
+        chains: { chainId: number }[];
+        mcpTools: string[];
+        endpoints: Record<string, string>;
+        payment: { tiers: unknown[] };
+      };
+      expect(card.protocol).toBe("a2mcp");
+      expect(card.custody).toBe("non-custodial");
+      expect(card.chains.length).toBeGreaterThanOrEqual(3); // 84532, 1952, 196
+      expect(card.mcpTools).toContain("w3cash_simulate_intent");
+      expect(card.endpoints.mcp).toContain("/mcp");
+      expect(Array.isArray(card.payment.tiers)).toBe(true);
+    }
+  });
+});
+
 describe("POST /simulate-intent (free dry-run)", () => {
   it("returns a verdict without the signable payload (no RPC in tests => unknown)", async () => {
     const { status, body } = await postJson("/simulate-intent", {

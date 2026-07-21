@@ -19,6 +19,7 @@ import {
 } from "./w3cash/encode.js";
 import { buildX402Middleware, getPaymentOptions } from "./x402.js";
 import { simulate } from "./simulate.js";
+import { getAgentCard } from "./agentcard.js";
 import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
 import { LANDING_HTML } from "./landing.js";
 
@@ -96,6 +97,16 @@ if (x402Middleware) app.use(x402Middleware);
 app.get("/payment-options", (_req: Request, res: Response) => {
   res.status(200).json({ ok: true, payment: getPaymentOptions(paymentConfig) });
 });
+
+// AgentCard — the machine-readable discovery descriptor (item 19). Served at both the
+// friendly path and the well-known convention agent frameworks probe.
+const agentCardHandler: RequestHandler = (req: Request, res: Response) => {
+  const proto = (req.headers["x-forwarded-proto"] as string) ?? "https";
+  const host = req.headers.host ?? "asp.w3.cash";
+  res.status(200).json(getAgentCard(`${proto}://${host}`, paymentConfig));
+};
+app.get("/agent-card", agentCardHandler);
+app.get("/.well-known/agent-card.json", agentCardHandler);
 
 // Landing page at the root — a read-only, self-contained visual of the live
 // service (renders /capabilities prettily). Static HTML; no wallet/execution.

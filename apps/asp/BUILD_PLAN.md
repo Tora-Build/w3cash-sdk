@@ -293,7 +293,11 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
     into every compile: gasPrice gwei-vs-wei, waitTime-in-the-past, closed one-time timeRange,
     zero price target, implausibly-large amount (decimals slip). *(Swap autoQuote via QuoterV2 +
     current-values annotation remain — RPC-dependent, follow-up; bridge autoQuote already ships.)*
-19. `[off]` **Distribution** — ERC-8004 self-registration + AgentCard + per-vertical skills.
+19. `[off]` **Distribution** ✅ (AgentCard) — machine-readable discovery descriptor at
+    `GET /agent-card` + `/.well-known/agent-card.json` (protocol, chains, MCP tools, endpoints,
+    payment tiers, safety), built from live config so it can't drift. *(ERC-8004 on-chain
+    self-registration + per-vertical skill split remain — the registration is a tx to an identity
+    registry; do it alongside the telemetry field from item 17.)*
 
 **Residual pre-freeze open items:** the three flash-frame formal proofs; the `MIN_RESET`
 floor value; op-encoding byte-headroom for `outToken`+`fundingParams`; recurring
