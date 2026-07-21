@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { W3CashProcessor, IGateAdapter, IActionAdapter, ISignatureTransfer } from "../src/w3cash/W3CashProcessor.sol";
+import { PostConditionAdapter } from "../src/w3cash/adapters/PostConditionAdapter.sol";
 
 // --- Mocks --------------------------------------------------------------
 
@@ -531,5 +532,122 @@ contract W3CashProcessorTest is Test {
         vm.prank(address(0xBAD));
         vm.expectRevert(W3CashProcessor.NotAuthorized.selector);
         proc.cancelIntent(g, it);
+    }
+
+    // --- Item 10: keeper tip --------------------------------------------
+
+    /// Policy with a distinct tip-token cap alongside the action cap.
+    function _policyWithTip(address tipToken, uint128 tipCap)
+        internal view returns (W3CashProcessor.Policy memory p)
+    {
+        p.allowedCodehashes = new bytes32[](1);
+        p.allowedCodehashes[0] = address(action).codehash;
+        p.gateCodehashes = new bytes32[](1);
+        p.gateCodehashes[0] = address(gate).codehash;
+        p.flashCodehashes = new bytes32[](0);
+        p.verbMask = proc.VERB_TRANSFER();
+        p.caps = new W3CashProcessor.TokenCap[](2);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 1000, resetPeriod: 0 });
+        p.caps[1] = W3CashProcessor.TokenCap({ token: tipToken, cap: tipCap, resetPeriod: 0 });
+    }
+
+    function _tipBundle(address tipToken, uint128 tipAmount, address keeper)
+        internal view returns (
+            W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+            W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops
+        )
+    {
+        p = _policyWithTip(tipToken, 100);
+        g = _grant(keccak256(abi.encode(p)));
+        ops = _ops(true, 600, false);
+        it = W3CashProcessor.Intent({
+            session: proc.grantDigest(g), opsHash: keccak256(abi.encode(ops)),
+            deadline: uint64(block.timestamp + 1 days), maxRuns: 1, cooldown: 0,
+            epoch: proc.epoch(root), salt: keccak256("tip-intent"),
+            tipToken: tipToken, tipAmount: tipAmount, keeperOfRecord: keeper
+        });
+    }
+
+    function test_Tip_PaysKeeper() public {
+        MockERC20 tip = new MockERC20();
+        tip.mint(root, 1e21);
+        vm.prank(root); tip.approve(address(proc), type(uint256).max);
+        address keeper = address(0xBEEF);
+        ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
+            _tipBundle(address(tip), 50, keeper);
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        assertEq(tip.balanceOf(keeper), 50);
+        (uint128 tipSpent, ) = proc.tipSpent(proc.grantDigest(g), address(tip));
+        assertEq(tipSpent, 50);
+    }
+
+    function test_Tip_OpenBounty_PaysRelayer() public {
+        MockERC20 tip = new MockERC20();
+        tip.mint(root, 1e21);
+        vm.prank(root); tip.approve(address(proc), type(uint256).max);
+        ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
+            _tipBundle(address(tip), 50, address(0)); // open bounty => msg.sender
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        assertEq(tip.balanceOf(address(this)), 50); // this test contract is the relayer
+    }
+
+    /// A dry tip allowance must NOT brick the protective action: tip degrades, execution succeeds.
+    function test_Tip_DryAllowance_DegradesNotBricks() public {
+        MockERC20 tip = new MockERC20();
+        tip.mint(root, 1e21); // funded but NO approval to the processor => transferFrom fails
+        ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
+            _tipBundle(address(tip), 50, address(0xBEEF));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        assertEq(tip.balanceOf(address(0xBEEF)), 0);        // tip not paid
+        (uint128 tipSpent, ) = proc.tipSpent(proc.grantDigest(g), address(tip));
+        assertEq(tipSpent, 0);                              // reserve refunded (item 10)
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 1); // action still ran
+    }
+
+    // --- Item 11: PostConditionAdapter (integration) --------------------
+
+    /// A post-condition ACTION that fails reverts the WHOLE intent (no partial execution).
+    function test_PostCondition_UnmetRevertsWholeIntent() public {
+        PostConditionAdapter pc = new PostConditionAdapter();
+        // Assert erc.balanceOf(root) >= a huge threshold that is FALSE => the intent must revert.
+        bytes memory checkData = abi.encode(
+            TOKEN,
+            abi.encodeWithSignature("balanceOf(address)", root),
+            uint8(3), // OP_GTE
+            type(uint256).max
+        );
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](2);
+        p.allowedCodehashes[0] = address(action).codehash;
+        p.allowedCodehashes[1] = address(pc).codehash;
+        p.gateCodehashes = new bytes32[](1);
+        p.gateCodehashes[0] = address(gate).codehash;
+        p.flashCodehashes = new bytes32[](0);
+        p.verbMask = proc.VERB_TRANSFER() | proc.VERB_ASSERT();
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 1000, resetPeriod: 0 });
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](3);
+        ops[0] = _gateOp(true);
+        ops[1] = _actionOp(W3CashProcessor.FundingMode.STANDING, 600);
+        ops[2] = W3CashProcessor.Op({ // post-condition: asserts an impossible balance => revert
+            kind: W3CashProcessor.OpKind.ACTION, target: address(pc), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "", data: checkData
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        uint256 rootBefore = erc.balanceOf(root);
+        vm.expectRevert(); // PostConditionFailed bubbles up, unwinding the whole intent
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+        assertEq(erc.balanceOf(root), rootBefore);              // the prior action's pull was unwound
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 0);  // nothing committed
     }
 }

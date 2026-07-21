@@ -19,13 +19,15 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *      reserve (reserve-before-every-pull, CEI), the multi-mode funding descriptor,
  *      Permit2/STANDING root pull + actual-delta metering, the SOLE-MOVER push-then-
  *      measure adapter feed, THREADED frame draw + measured-output frame credit, three
- *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip, the
- *      controlled-callback flash frame (item 7 — adapter-as-receiver [F2] + opsHash-bound
- *      sub-group + transient expected-adapter pin + single-use slot + zero-on-exit [F1];
- *      THREADED-only sub-ops), frame-sourced native value (item 8 — caller-first-then-
- *      frame draw, unwrap→send-ETH; native is caller/frame-supplied, unmetered), and the
- *      on-chain hardening cluster (item 9 — reject PERMIT2 on recurring, MIN_RESET floor,
- *      cancelIntent authorized via the grant, staticcall+exact-magic 1271).
+ *      revocation tiers, ERC-1271 root, native pause-refund, the controlled-callback flash
+ *      frame (item 7 — adapter-as-receiver [F2] + opsHash-bound sub-group + transient
+ *      expected-adapter pin + single-use slot + zero-on-exit [F1]; THREADED-only sub-ops),
+ *      frame-sourced native value (item 8 — caller-first-then-frame draw, unwrap→send-ETH;
+ *      native is caller/frame-supplied, unmetered), the on-chain hardening cluster (item 9 —
+ *      reject PERMIT2 on recurring, MIN_RESET floor, cancelIntent authorized via the grant,
+ *      staticcall+exact-magic 1271), and the gas-capped best-effort keeper tip with a
+ *      dedicated sub-budget + reserve-then-refund (item 10). The PostConditionAdapter
+ *      (item 11) ships as a standalone VERB_ASSERT adapter (revert-on-unmet post-check).
  *      REMAINING (marked `NOTE(freeze):`) — ERC-7739 nested-712 for the 1271 root branch;
  *      a root-sourced flash premium/shortfall top-up (deferred — strategies self-fund the
  *      repay today); and the Permit2 WITNESS typestring + per-chain golden vectors (item 12).
@@ -106,6 +108,10 @@ contract W3CashProcessor is EIP712 {
     uint32 public constant VERB_BRIDGE   = 1 << 4;
     uint32 public constant VERB_TIP      = 1 << 5;
     uint32 public constant VERB_FLASH    = 1 << 6; // controlled flash sub-group initiator
+    uint32 public constant VERB_ASSERT   = 1 << 7; // post-condition (delta/slippage) revert guard
+
+    /// @dev Best-effort keeper-tip gas cap (RIDER-1 R1.2). Bounds a hostile tipToken's griefing.
+    uint256 private constant TIP_GAS_CAP = 150_000;
 
     // EIP-712 typehashes. epoch is an explicit field of BOTH structs (Addendum C #9) so a
     // Tier-3 incrementEpoch() invalidates grant AND intent digests directly.
@@ -656,11 +662,20 @@ contract W3CashProcessor is EIP712 {
         uint256 room = cap.cap > c.spent ? cap.cap - c.spent : 0;
         uint256 pay = it.tipAmount < room ? it.tipAmount : room; // clamp
         if (pay == 0) { emit TipSkipped(iDigest, "NO_ROOM"); return; }
-        c.spent = uint128(uint256(c.spent) + pay);
+        c.spent = uint128(uint256(c.spent) + pay);                 // reserve (dedicated sub-budget)
         address to = it.keeperOfRecord != address(0) ? it.keeperOfRecord : msg.sender;
-        // NOTE(freeze): gas-capped low-level best-effort tipToken.transferFrom(root, to, pay) after
-        // all state updates; on failure emit TipSkipped and continue (never brick the action).
-        root; // silence unused in skeleton
+        // Gas-capped, best-effort pull from root's standing tipToken allowance to the keeper. On any
+        // failure (dry allowance, malicious/hostile token, OOG) REFUND the reserve and continue —
+        // a failed tip degrades the intent to untipped, NEVER bricks the protective action.
+        (bool ok, bytes memory ret) = it.tipToken.call{ gas: TIP_GAS_CAP }(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, root, to, pay)
+        );
+        bool paid = ok && (ret.length == 0 || abi.decode(ret, (bool)));
+        if (!paid) {
+            c.spent = uint128(uint256(c.spent) - pay);            // reserve-then-refund (item 10)
+            emit TipSkipped(iDigest, "TRANSFER_FAILED");
+            return;
+        }
         emit TipPaid(iDigest, to, it.tipToken, pay);
     }
 
