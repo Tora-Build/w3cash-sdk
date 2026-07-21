@@ -279,7 +279,9 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
     (`OnlyProcessor`-faithful) for pass/blocked, reads initiator balance + adapter allowance for
     setup fix-its, gasPrice gate compared to live gas. Verdict `would-fire|blocked|needs-setup|
     unknown`; RPC failure degrades to `unknown`, never throws. Injectable reader (unit-tested).
-15. `[off]` **Fix the free/paid x402 ladder** — gate ops/`toSign` behind paid compile.
+15. `[off]` **Free/paid x402 ladder** ✅ — property holds (`/compile-intent` x402-gated;
+    `/simulate-intent` FREE + verdict-only, no payload leak); ladder discoverable in
+    `GET /payment-options.tiers`.
 16. `[off]` **Dynamic payment** ✅ — multi-`accepts[]` (primary `NETWORK` + `PAYMENT_NETWORKS`,
     sanitized/de-duped, default first), `GET /payment-options` + `w3cash_payment_options` MCP
     tool (disclosure of chains + default), and `X-Payment-Network` echo on the paid response.
@@ -287,7 +289,10 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
     tracking — kept fail-open-to-FREE for uptime; revisit with the ladder in item 15.)*
 17. `[off]` **Intent status + neutral telemetry** — CF Workers cron-indexer over chain
     events (84532/1952), reliability stats from a reproducible on-chain denominator.
-18. `[off]` **Compile-time sanity layer** — threshold/decimal lint + swap/bridge autoQuote.
+18. `[off]` **Compile-time sanity layer** ✅ (lints) — best-effort, never-blocks warnings folded
+    into every compile: gasPrice gwei-vs-wei, waitTime-in-the-past, closed one-time timeRange,
+    zero price target, implausibly-large amount (decimals slip). *(Swap autoQuote via QuoterV2 +
+    current-values annotation remain — RPC-dependent, follow-up; bridge autoQuote already ships.)*
 19. `[off]` **Distribution** — ERC-8004 self-registration + AgentCard + per-vertical skills.
 
 **Residual pre-freeze open items:** the three flash-frame formal proofs; the `MIN_RESET`

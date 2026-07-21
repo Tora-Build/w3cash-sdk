@@ -53,4 +53,13 @@ describe("getPaymentOptions", () => {
     const opts = getPaymentOptions({ network: "eip155:196" }, "$0.01");
     expect(opts.enabled).toBe(false); // enabled also gated on X402_ENABLED at runtime
   });
+
+  it("exposes the free→paid pricing ladder (item 15)", () => {
+    const opts = getPaymentOptions({ network: "eip155:196", payTo: "0xabc" }, "$0.01");
+    const preview = opts.tiers.find((t) => t.tier === "preview");
+    const compile = opts.tiers.find((t) => t.tier === "compile");
+    expect(preview?.price).toBe("free");
+    expect(preview?.returns).toContain("NO signable payload");
+    expect(compile?.endpoint).toBe("POST /compile-intent");
+  });
 });

@@ -75,10 +75,19 @@ export interface PaymentOption {
   readonly isDefault: boolean;
 }
 
+export interface PaymentTier {
+  readonly tier: string;
+  readonly endpoint: string;
+  readonly price: string;
+  readonly returns: string;
+}
+
 export interface PaymentOptions {
   readonly enabled: boolean;
   readonly default: Caip2 | null;
   readonly options: readonly PaymentOption[];
+  /** The pricing ladder (item 15): free preview → metered compile → (future) subscription. */
+  readonly tiers: readonly PaymentTier[];
   readonly note: string;
 }
 
@@ -101,8 +110,13 @@ export function getPaymentOptions(
     enabled: enabled && options.length > 0 && payTo !== "",
     default: nets[0] ?? null,
     options,
+    tiers: [
+      { tier: "preview", endpoint: "POST /simulate-intent", price: "free", returns: "verdict + gate status + setup fix-its (NO signable payload)" },
+      { tier: "compile", endpoint: "POST /compile-intent", price, returns: "the full signable intent (operations, instruction, toSign)" },
+      { tier: "subscription", endpoint: "(future)", price: "TBD", returns: "keeper/telemetry value-add — not yet enabled" },
+    ],
     note:
-      "The 402 challenge advertises all of these; your x402 client picks one, or omits a preference to pay the default. The chosen chain is echoed on the paid response as X-Payment-Network.",
+      "Pricing ladder: FREE simulate → metered compile → (future) subscription. The 402 challenge advertises every payment chain above; your x402 client picks one, or omits a preference to pay the default. The chosen chain is echoed on the paid response as X-Payment-Network.",
   };
 }
 

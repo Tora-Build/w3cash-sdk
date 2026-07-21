@@ -30,6 +30,7 @@ import {
   type Hex,
   type Address,
 } from "viem";
+import { sanityWarnings } from "./sanity.js";
 
 // ---------------------------------------------------------------------------
 // Deployment constants (Base Sepolia, chainId 84532)
@@ -1753,6 +1754,9 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
         : "auto-expiry was NOT applied (no `now` clock provided); this signature has no on-chain time bound. Pass `now` (unix seconds) to enable the safe-default expiry, or cancel via incrementNonce()."
     );
   }
+
+  // Compile-time sanity lints (item 18) — best-effort advisories, never blocks.
+  for (const w of sanityWarnings(request)) warnings.push(w);
 
   const { payload, payloadHash, header, instruction, toSign } = encodeEnvelope(
     operations,
