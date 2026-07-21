@@ -19,14 +19,16 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *      reserve (reserve-before-every-pull, CEI), the multi-mode funding descriptor,
  *      Permit2/STANDING root pull + actual-delta metering, the SOLE-MOVER push-then-
  *      measure adapter feed, THREADED frame draw + measured-output frame credit, three
- *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip, and
- *      the controlled-callback flash frame (item 7 — adapter-as-receiver [F2] +
- *      opsHash-bound sub-group + transient expected-adapter pin + single-use slot +
- *      zero-on-exit [F1]; THREADED-only sub-ops so the callback needs no policy/cap).
- *      REMAINING (marked `NOTE(freeze):`) — frame-sourced native value (item 8); the
- *      on-chain hardening cluster (item 9); a root-sourced flash premium/shortfall
- *      top-up (deferred — strategies self-fund the repay today); and the Permit2
- *      WITNESS typestring + per-chain golden vectors (item 12). NOT deployable yet.
+ *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip, the
+ *      controlled-callback flash frame (item 7 — adapter-as-receiver [F2] + opsHash-bound
+ *      sub-group + transient expected-adapter pin + single-use slot + zero-on-exit [F1];
+ *      THREADED-only sub-ops), frame-sourced native value (item 8 — caller-first-then-
+ *      frame draw, unwrap→send-ETH; native is caller/frame-supplied, unmetered), and the
+ *      on-chain hardening cluster (item 9 — reject PERMIT2 on recurring, MIN_RESET floor,
+ *      cancelIntent authorized via the grant, staticcall+exact-magic 1271).
+ *      REMAINING (marked `NOTE(freeze):`) — ERC-7739 nested-712 for the 1271 root branch;
+ *      a root-sourced flash premium/shortfall top-up (deferred — strategies self-fund the
+ *      repay today); and the Permit2 WITNESS typestring + per-chain golden vectors (item 12).
  *
  * Invariants preserved from the substrate (see DECISIONS.md ADR-0001):
  *   (1) PAUSE→resume: a failed gate returns before ANY state write; re-submitting the
@@ -42,6 +44,12 @@ contract W3CashProcessor is EIP712 {
     address public immutable permit2;
     /// @dev THREADED fundAmount sentinel: draw the whole frame balance (UniversalRouter CONTRACT_BALANCE).
     uint128 private constant CONTRACT_BALANCE = type(uint128).max;
+    /// @dev Native-ETH sentinel for `Op.outToken` (Safe/1inch 0xEeee… convention). address(0) = "no
+    /// output register". Native is caller (msg.value) / frame (unwrap output) supplied — never a root
+    /// pull — so it is NOT metered against a root cap (item 8).
+    address private constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    /// @dev Minimum rolling-window period (item 9) — floors resetPeriod so it can't degrade to per-block.
+    uint40 private constant MIN_RESET = 1 hours;
 
     // ---------------------------------------------------------------------
     // Errors
@@ -68,7 +76,6 @@ contract W3CashProcessor is EIP712 {
     error Reentrancy();
     error ThreadedOutsideFrame();
     error InsufficientFrameBalance();
-    error ValueNotConserved();
     error TooManyEntries();
     error NativeRefundFailed();
     error NotExpectedAdapter();  // flash callback caller != the transiently-pinned adapter
@@ -76,6 +83,10 @@ contract W3CashProcessor is EIP712 {
     error NestedFlash();         // a flash sub-op is itself a flash op (no nesting)
     error SubGroupMismatch();    // callback sub-group hash != the dispatch-bound hash
     error RepayShortfall();      // frame can't cover principal + premium at repay
+    error InsufficientNative();  // op.value exceeds caller (msg.value) + frame native
+    error ResetTooShort();       // TokenCap.resetPeriod below MIN_RESET (item 9)
+    error PermitRecurring();     // PERMIT2 funding on a recurring intent (maxRuns != 1) (item 9)
+    error NotAuthorized();       // cancelIntent caller is neither root nor sessionKey (item 9)
 
     // ---------------------------------------------------------------------
     // Constants
@@ -241,7 +252,7 @@ contract W3CashProcessor is EIP712 {
         if (block.timestamp < uint256(s.lastExecuted) + it.cooldown) revert Cooldown();
 
         // 4. POLICY + op-kind shape gate (Addendum C #1) — GATE ops must precede ACTION ops.
-        uint256 boundary = _checkPolicyAndShape(policy, ops);
+        uint256 boundary = _checkPolicyAndShape(policy, ops, it.maxRuns);
 
         // 5. GATES [0, boundary) — read-only; a failure PAUSES with ZERO writes (invariant 1).
         for (uint256 i = 0; i < boundary; ++i) {
@@ -258,10 +269,12 @@ contract W3CashProcessor is EIP712 {
         s.lastExecuted = uint40(block.timestamp);
 
         // 7. ACTIONS [boundary, len) — reserve-before-EVERY-pull, then SOLE-MOVER feed + run.
-        uint256 forwarded;
+        // Native forwarded as op.value draws caller ETH (msg.value) FIRST, then frame native
+        // (unwrap output) — never a root pull, so it is unmetered (item 8).
+        uint256 callerNative = msg.value;
         for (uint256 i = boundary; i < ops.length; ++i) {
             Op calldata op = ops[i];
-            forwarded += op.value;
+            if (op.value != 0) callerNative = _drawNative(op.value, callerNative);
             if (_adapterVerb(op.target) & VERB_FLASH != 0) {
                 _runFlashOp(policy, op, root); // controlled-callback flash sub-group (item 7)
             } else {
@@ -274,9 +287,10 @@ contract W3CashProcessor is EIP712 {
         // 8. RIDER-1 tip — clamp-and-meter against the DEDICATED tip sub-budget (Addendum C #8).
         _payTipMetered(gDigest, policy, it, root, iDigest);
 
-        // 9. msg.value conservation + sweep residual to the caller (never stranded).
-        if (forwarded > msg.value) revert ValueNotConserved();
-        if (msg.value > forwarded) _sweepNative(msg.sender, msg.value - forwarded);
+        // 9. Sweep leftover native: unused caller ETH -> msg.sender; frame native (root's) -> root.
+        if (callerNative > 0) _sweepNative(msg.sender, callerNative);
+        uint256 frameNative = _frameGet(NATIVE);
+        if (frameNative > 0) { _frameSet(NATIVE, 0); _sweepNative(root, frameNative); }
 
         _exitFrame();
         emit WorkflowExecuted(iDigest, root, s.executions);
@@ -297,8 +311,11 @@ contract W3CashProcessor is EIP712 {
         emit EpochIncremented(msg.sender, e);
     }
 
-    function cancelIntent(Intent calldata it) external { // per-intent (sub-session granularity)
-        // NOTE(freeze): authorize via the session's root; skeleton keys off the intent digest.
+    /// @notice Per-intent selective cancel (sub-session granularity). Authorized by the session's
+    /// root OR its session key; the grant binds the intent (it.session == gDigest) (item 9).
+    function cancelIntent(SessionGrant calldata g, Intent calldata it) external {
+        if (msg.sender != g.root && msg.sender != g.sessionKey) revert NotAuthorized();
+        if (it.session != _grantDigest(g)) revert WrongSession();
         bytes32 iDigest = _intentDigest(it);
         intentState[iDigest].cancelled = true;
         emit IntentCancelled(iDigest);
@@ -340,9 +357,11 @@ contract W3CashProcessor is EIP712 {
     // ---------------------------------------------------------------------
     function _verifyRoot(address root, bytes32 digest, bytes calldata sig) internal view {
         if (root.code.length > 0) {
-            // staticcall only; exact magic-value equality (Addendum C #10).
-            // NOTE(freeze): prefer ERC-7739 nested-712 for the root branch to defeat
-            // cross-context replay of a naive-1271 account.
+            // staticcall only (view — a stateful/reentrant 1271 can't mutate here); require the
+            // EXACT modern magic 0x1626ba7e, which also rejects the legacy 0x20c13b0b selector.
+            // NOTE(freeze, item 9): wrap `digest` in ERC-7739 nested-712 before the 1271 call to
+            // defeat cross-context replay of a naive raw-hash 1271 account, + a per-chain golden
+            // vector proving a 7739-Safe accepts and a raw-hash mock (intentionally) does not.
             (bool ok, bytes memory ret) = root.staticcall(
                 abi.encodeWithSelector(IERC1271.isValidSignature.selector, digest, sig)
             );
@@ -355,16 +374,16 @@ contract W3CashProcessor is EIP712 {
     // ---------------------------------------------------------------------
     // Policy + op-kind shape (Addendum C #1)
     // ---------------------------------------------------------------------
-    function _checkPolicyAndShape(Policy calldata p, Op[] calldata ops)
+    function _checkPolicyAndShape(Policy calldata p, Op[] calldata ops, uint32 maxRuns)
         internal
         view
         returns (uint256 boundary)
     {
         // Fail-closed length + fail-closed empties.
         if (p.allowedCodehashes.length > MAX_TARGETS || p.gateCodehashes.length > MAX_TARGETS
-            || p.caps.length > MAX_CAPS) revert TooManyEntries();
+            || p.flashCodehashes.length > MAX_TARGETS || p.caps.length > MAX_CAPS) revert TooManyEntries();
         if (p.allowedCodehashes.length == 0 || p.verbMask == 0) revert PolicyDenied(); // deny-all defaults
-        _assertNoDupCaps(p);
+        _assertCaps(p); // no-dup + MIN_RESET floor (item 9)
 
         bool seenAction = false;
         boundary = ops.length;
@@ -388,13 +407,16 @@ contract W3CashProcessor is EIP712 {
                     if (_adapterKind(op.target) != KIND_ACTION) revert PolicyDenied();
                     // Root-sourced funded ops must name a capped token; a NONE-funded action must NOT name a
                     // fundToken (else it looks funded but is never reserved — an uncounted-pull footgun).
-                    if (op.funding == FundingMode.PERMIT2 || op.funding == FundingMode.STANDING) {
+                    if (op.funding == FundingMode.PERMIT2) {
+                        if (maxRuns != 1) revert PermitRecurring();          // one-shot SignatureTransfer only (item 9)
+                        if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
+                    } else if (op.funding == FundingMode.STANDING) {
                         if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
                     } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
                         revert PolicyDenied();
                     }
                 }
-                if (op.value != 0 && _capIndex(p, address(0)) == NONE) revert TokenNotCapped(); // native cap (Addendum C #11)
+                // Native op.value is caller/frame-supplied (never a root pull) => NOT cap-metered (item 8).
             }
         }
     }
@@ -480,15 +502,36 @@ contract W3CashProcessor is EIP712 {
     /// delta to the frame ledger for downstream THREADED ops. SOLE-MOVER: the adapter is a pure
     /// function of pushed tokens + value + data and cannot reach root funds.
     function _feedAndRun(Op memory op, address root, uint256 fed) internal {
-        if (op.fundToken != address(0) && fed > 0) {
+        if (op.fundToken != address(0) && op.fundToken != NATIVE && fed > 0) {
             IERC20(op.fundToken).safeTransfer(op.target, fed);
         }
-        uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+        // Output register: NATIVE => measure the native balance delta (unwrap output); an ERC20
+        // outToken => measure its balanceOf delta; address(0) => no output register.
+        uint256 outBefore;
+        if (op.outToken == NATIVE) outBefore = address(this).balance;
+        else if (op.outToken != address(0)) outBefore = IERC20(op.outToken).balanceOf(address(this));
+
         IActionAdapter(op.target).run{ value: op.value }(root, op.data);
-        if (op.outToken != address(0)) {
+
+        if (op.outToken == NATIVE) {
+            // `received = balAfter + op.value - balBefore` (op.value left during the call).
+            uint256 balAfter = address(this).balance + op.value;
+            if (balAfter > outBefore) _frameCredit(NATIVE, balAfter - outBefore);
+        } else if (op.outToken != address(0)) {
             uint256 outAfter = IERC20(op.outToken).balanceOf(address(this));
             if (outAfter > outBefore) _frameCredit(op.outToken, outAfter - outBefore);
         }
+    }
+
+    /// @dev Authorize op.value native: draw caller ETH first, then frame native (unwrap output).
+    /// Returns the remaining caller balance. Reverts if neither source covers it.
+    function _drawNative(uint256 v, uint256 callerNative) internal returns (uint256) {
+        if (v <= callerNative) return callerNative - v;
+        uint256 fromFrame = v - callerNative;
+        uint256 avail = _frameGet(NATIVE);
+        if (avail < fromFrame) revert InsufficientNative();
+        _frameSet(NATIVE, avail - fromFrame);
+        return 0;
     }
 
     /// @dev Draw a THREADED input from the frame ledger (never counts vs. the cap). Used inside the
@@ -531,6 +574,7 @@ contract W3CashProcessor is EIP712 {
             Op memory s = subOps[i];
             if (s.kind != OpKind.ACTION) revert PolicyDenied();
             if (s.funding != FundingMode.THREADED) revert PolicyDenied();
+            if (s.value != 0) revert PolicyDenied(); // no native forwarding inside a flash sub-group
             uint32 v = _adapterVerb(s.target);
             if (v & VERB_FLASH != 0) revert NestedFlash();
             if (v & p.verbMask == 0) revert PolicyDenied();
@@ -628,10 +672,14 @@ contract W3CashProcessor is EIP712 {
         return NONE;
     }
 
-    function _assertNoDupCaps(Policy calldata p) internal pure {
-        for (uint256 i = 0; i < p.caps.length; ++i)
+    function _assertCaps(Policy calldata p) internal pure {
+        for (uint256 i = 0; i < p.caps.length; ++i) {
+            // MIN_RESET floor: a rolling window can't be set to per-block (item 9).
+            uint40 rp = p.caps[i].resetPeriod;
+            if (rp != 0 && rp < MIN_RESET) revert ResetTooShort();
             for (uint256 j = i + 1; j < p.caps.length; ++j)
                 if (p.caps[i].token == p.caps[j].token) revert PolicyDenied();
+        }
     }
 
     function _codehashIn(bytes32[] calldata set, address target) internal view returns (bool) {

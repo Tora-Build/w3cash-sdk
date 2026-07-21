@@ -65,6 +65,32 @@ contract MockSwapAction is IActionAdapter {
     }
 }
 
+/// @dev Unwrap action: fed WETH (ERC20), sends native ETH back to the processor (outToken=NATIVE).
+contract MockUnwrapAction is IActionAdapter {
+    address public weth;
+    constructor(address _weth) { weth = _weth; }
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function verb() external pure returns (uint32) { return 1 << 3; } // VERB_WRAP
+    function run(address, bytes calldata) external payable returns (bytes memory) {
+        uint256 bal = MockERC20(weth).balanceOf(address(this));
+        MockERC20(weth).transfer(address(0xdead), bal);   // "burn" the WETH
+        (bool ok, ) = msg.sender.call{ value: bal }("");  // send equal native back to the processor
+        require(ok, "unwrap send failed");
+        return "";
+    }
+    receive() external payable {}
+}
+
+/// @dev Native-sink action: forwarded op.value; records what it received.
+contract MockNativeSink is IActionAdapter {
+    uint256 public received;
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function verb() external pure returns (uint32) { return 1 << 0; } // VERB_TRANSFER
+    function run(address, bytes calldata) external payable returns (bytes memory) {
+        received += msg.value; return "";
+    }
+}
+
 interface IProcessorFlash {
     function onFlashLoan(address asset, uint256 amount, uint256 premium, bytes calldata cb) external returns (bytes4);
 }
@@ -339,16 +365,17 @@ contract W3CashProcessorTest is Test {
     }
 
     function test_RollingWindow_ResetsAfterPeriod() public {
+        uint40 win = 3600; // == MIN_RESET (1h)
         ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
-        ) = _bundle(true, 1000, 100, 600, 0, 1);
+        ) = _bundle(true, 1000, win, 600, 0, 60);
         proc.execute(g, rootSig, p, it, ops, sessSig);
         (uint128 s1, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(s1, 600);
-        vm.warp(block.timestamp + 2);
-        vm.expectRevert(W3CashProcessor.CapExceeded.selector);
+        vm.warp(block.timestamp + 61);
+        vm.expectRevert(W3CashProcessor.CapExceeded.selector); // within window: 1200 > 1000
         proc.execute(g, rootSig, p, it, ops, sessSig);
-        vm.warp(block.timestamp + 200);
+        vm.warp(block.timestamp + win + 1); // past the window: resets
         proc.execute(g, rootSig, p, it, ops, sessSig);
         (uint128 s2, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(s2, 600);
@@ -416,5 +443,93 @@ contract W3CashProcessorTest is Test {
     function test_FlashCallback_RejectsUnpinnedCaller() public {
         vm.expectRevert(W3CashProcessor.NotExpectedAdapter.selector);
         proc.onFlashLoan(TOKEN, 1000, 0, "");
+    }
+
+    // --- Item 8: native ETH ---------------------------------------------
+
+    address internal constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    /// Unwrap WETH → send ETH: op0 produces native into the frame, op1 forwards it as op.value.
+    /// The old msg.value-conservation check would have bricked this (forwarded > msg.value==0).
+    function test_Native_UnwrapThenSendEth() public {
+        MockUnwrapAction unwrap = new MockUnwrapAction(TOKEN);
+        MockNativeSink sink = new MockNativeSink();
+        vm.deal(address(unwrap), 500); // native the unwrap returns
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](2);
+        p.allowedCodehashes[0] = address(unwrap).codehash;
+        p.allowedCodehashes[1] = address(sink).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](0);
+        p.verbMask = (1 << 3) | (1 << 0); // VERB_WRAP | VERB_TRANSFER
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 1000, resetPeriod: 0 });
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](2);
+        ops[0] = W3CashProcessor.Op({ // unwrap: WETH in (capped), native out
+            kind: W3CashProcessor.OpKind.ACTION, target: address(unwrap), value: 0,
+            funding: W3CashProcessor.FundingMode.STANDING, fundToken: TOKEN, fundAmount: 500,
+            outToken: NATIVE, fundingParams: "", data: ""
+        });
+        ops[1] = W3CashProcessor.Op({ // send-ETH: forwards 500 native drawn from the frame
+            kind: W3CashProcessor.OpKind.ACTION, target: address(sink), value: 500,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "", data: ""
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+
+        assertEq(sink.received(), 500);            // native forwarded from the frame (msg.value was 0)
+        (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
+        assertEq(spent, 500);                       // only the WETH input is cap-metered
+        assertEq(address(proc).balance, 0);         // no native stranded
+    }
+
+    // --- Item 9: hardening cluster --------------------------------------
+
+    function test_Item9_Permit2OnRecurring_Reverts() public {
+        W3CashProcessor.Policy memory p = _policy(1000, 3600);
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](2);
+        ops[0] = _gateOp(true);
+        W3CashProcessor.Op memory a = _actionOp(W3CashProcessor.FundingMode.PERMIT2, 600);
+        a.fundingParams = abi.encode(uint256(1), block.timestamp + 1 days, bytes("sig"));
+        ops[1] = a;
+        // recurring: maxRuns 0, cooldown 1 => PERMIT2 must be rejected (one-shot nonces only).
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 0, 1);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+        vm.expectRevert(W3CashProcessor.PermitRecurring.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    function test_Item9_MinResetFloor_Reverts() public {
+        // resetPeriod 60s is below MIN_RESET (1h) => rejected.
+        ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
+        ) = _bundle(true, 1000, 60, 600, 0, 1);
+        vm.expectRevert(W3CashProcessor.ResetTooShort.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    function test_Item9_CancelIntent_RootCancels() public {
+        ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
+        ) = _bundle(true, 1000, 0, 600, 1, 0);
+        vm.prank(root);
+        proc.cancelIntent(g, it);
+        vm.expectRevert(W3CashProcessor.Cancelled.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    function test_Item9_CancelIntent_StrangerRejected() public {
+        ( W3CashProcessor.SessionGrant memory g, , , W3CashProcessor.Intent memory it, , ) =
+            _bundle(true, 1000, 0, 600, 1, 0);
+        vm.prank(address(0xBAD));
+        vm.expectRevert(W3CashProcessor.NotAuthorized.selector);
+        proc.cancelIntent(g, it);
     }
 }
