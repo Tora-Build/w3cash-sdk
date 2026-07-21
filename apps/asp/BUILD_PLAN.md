@@ -274,8 +274,11 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
 **Off-chain — Phase-1 suite (ships now):**
 13. `[off]` Encoder safe-by-default (✅ partly done) + rebasing allowlist + dedicated
     one-shot Permit2 nonce + never emit a root→adapter approval.
-14. `[off]` **`w3cash_simulate_intent`** — FREE static-read + `eth_call` dry-run,
-    **verdict-only (no payload leak)**; honest fidelity split (no pre-sign Permit2 claim).
+14. `[off]` **`w3cash_simulate_intent`** ✅ — FREE `POST /simulate-intent` + MCP tool: compiles
+    internally (validates, never returns the payload), eth_calls each gate from the processor
+    (`OnlyProcessor`-faithful) for pass/blocked, reads initiator balance + adapter allowance for
+    setup fix-its, gasPrice gate compared to live gas. Verdict `would-fire|blocked|needs-setup|
+    unknown`; RPC failure degrades to `unknown`, never throws. Injectable reader (unit-tested).
 15. `[off]` **Fix the free/paid x402 ladder** — gate ops/`toSign` behind paid compile.
 16. `[off]` **Dynamic payment** ✅ — multi-`accepts[]` (primary `NETWORK` + `PAYMENT_NETWORKS`,
     sanitized/de-duped, default first), `GET /payment-options` + `w3cash_payment_options` MCP

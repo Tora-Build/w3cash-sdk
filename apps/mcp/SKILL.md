@@ -53,6 +53,7 @@ the **same addresses** on 1952 and 196 (deterministic deploy).
 | Tool                    | When to use                                                                 |
 | ----------------------- | --------------------------------------------------------------------------- |
 | `w3cash_capabilities`   | **ALWAYS FIRST**, with the target `chain`. Learn the exact types + fields.  |
+| `w3cash_simulate_intent`| **FREE dry-run BEFORE compiling** — "would it fire / which gate blocks / what setup you need". |
 | `w3cash_compile_intent` | Compile `{chain, initiator, nonce, conditions[], actions[]}` → signable intent. |
 | `w3cash_bridge_quote`   | Preview a live Across quote before a cross-chain `bridge` (Base Sepolia).    |
 | `w3cash_recipes`        | Ready-to-edit templates for the given `chain`.                              |

@@ -18,6 +18,9 @@ let server: Server;
 let base = "";
 
 beforeAll(async () => {
+  // Point simulate's RPC at a fast-fail address so tests never hit a live network
+  // (the endpoint degrades every check to "unknown" — the wiring is what we assert).
+  process.env.SIM_RPC_84532 = "http://127.0.0.1:1";
   await new Promise<void>((resolve) => {
     server = app.listen(0, () => resolve());
   });
@@ -252,6 +255,39 @@ describe("POST /compile-intent — happy path", () => {
     );
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
+  });
+});
+
+describe("POST /simulate-intent (free dry-run)", () => {
+  it("returns a verdict without the signable payload (no RPC in tests => unknown)", async () => {
+    const { status, body } = await postJson("/simulate-intent", {
+      chain: CHAIN_ID,
+      initiator: DEAD,
+      expiry: "none",
+      conditions: [{ type: "waitTime", timestamp: 1 }],
+      actions: [{ type: "transfer", token: USDC, to: DEAD, amount: "1000000" }],
+    });
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    const sim = body.simulation as {
+      verdict: string;
+      gates: unknown[];
+      setup: unknown[];
+      notes: string[];
+    };
+    expect(["would-fire", "blocked", "needs-setup", "unknown"]).toContain(sim.verdict);
+    expect(Array.isArray(sim.gates)).toBe(true);
+    // Must NOT leak the compiled payload (that's the paid compile's deliverable).
+    expect(body.simulation).not.toHaveProperty("toSign");
+    expect(body.simulation).not.toHaveProperty("operations");
+  });
+
+  it("400s on a malformed intent (same validation as compile)", async () => {
+    const { status, body } = await postJson("/simulate-intent", {
+      actions: [{ type: "transfer", token: "0xnope", to: DEAD, amount: "1" }],
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe("VALIDATION");
   });
 });
 

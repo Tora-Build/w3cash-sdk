@@ -202,6 +202,45 @@ export function registerTools(server: McpServer): void {
   );
 
   // -------------------------------------------------------------------------
+  // 5b. Simulate — FREE pre-sign dry-run. Call BEFORE compiling to check readiness.
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "w3cash_simulate_intent",
+    {
+      title: "W3Cash: simulate an intent (free dry-run)",
+      description:
+        "FREE pre-sign dry-run: answers \"would this fire right now / which gate is blocking / what " +
+        "setup do I still need\" BEFORE anyone signs or pays for a compile. Takes the SAME " +
+        "{chain, conditions, actions} as w3cash_compile_intent, plus `initiator` (the address whose " +
+        "funds/approvals the actions use — required for balance/allowance checks). Returns a `verdict` " +
+        "(would-fire | blocked | needs-setup | unknown), per-gate status (pass/blocked/unknown, with " +
+        "how far off), and `setup` fix-its (e.g. \"approve USDC for the TransferAdapter\", \"top up " +
+        "0.5 more WETH\"). It NEVER returns the signable payload — that is the paid w3cash_compile_intent. " +
+        "Gates are evaluated at the CURRENT block, not the future fire time (a co-signer gate can't be " +
+        "simulated without the co-signature). Use this first to avoid paying to compile an intent that " +
+        "can't fire yet.",
+      inputSchema: {
+        chain: z.number().int().optional().default(84532)
+          .describe("EVM chain id: 84532 (Base Sepolia, default), 1952 (X Layer testnet), or 196 (X Layer mainnet)."),
+        initiator: z.string().optional()
+          .describe("Address whose funds/approvals the actions use. Required for balance/allowance readiness; gates still evaluate without it."),
+        conditions: z.array(z.record(z.string(), z.unknown())).optional()
+          .describe("Gate objects (the Y), each { type, ...fields }. Same shape as w3cash_compile_intent."),
+        actions: z.array(z.record(z.string(), z.unknown())).optional()
+          .describe("Action objects (the X), each { type, ...fields }. Same shape as w3cash_compile_intent."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => {
+      const body: Record<string, unknown> = { chain: args.chain };
+      if (args.initiator !== undefined) body.initiator = args.initiator;
+      if (args.conditions !== undefined) body.conditions = args.conditions;
+      if (args.actions !== undefined) body.actions = args.actions;
+      return present(await aspPost("/simulate-intent", body));
+    },
+  );
+
+  // -------------------------------------------------------------------------
   // 6. Payment options — which chains the compile fee can be paid on.
   // -------------------------------------------------------------------------
   server.registerTool(

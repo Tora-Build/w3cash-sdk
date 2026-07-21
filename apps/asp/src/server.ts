@@ -18,6 +18,7 @@ import {
   type CompileRequest,
 } from "./w3cash/encode.js";
 import { buildX402Middleware, getPaymentOptions } from "./x402.js";
+import { simulate } from "./simulate.js";
 import { fetchAcrossQuote, AcrossQuoteError } from "./across.js";
 import { LANDING_HTML } from "./landing.js";
 
@@ -351,6 +352,22 @@ const getCompileHandler: RequestHandler = (req: Request, res: Response) => {
 // Payment gating (when enabled) is applied globally above via buildX402Middleware.
 app.get("/compile-intent", getCompileHandler);
 app.post("/compile-intent", compileHandler);
+
+// FREE pre-sign dry-run (Phase-1 item 14). Same body as /compile-intent (+ `initiator` for
+// balance/allowance checks). Returns a verdict + fix-its, NEVER the signable payload — the
+// free hook that leads to the paid compile. Not x402-gated (only /compile-intent is).
+app.post("/simulate-intent", async (req: Request, res: Response) => {
+  try {
+    const result = await simulate(req.body as CompileRequest);
+    res.status(200).json({ ok: true, simulation: result });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      res.status(400).json({ ok: false, error: err.message, code: "VALIDATION" });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "internal error", code: "INTERNAL" });
+  }
+});
 
 // 404 JSON fallback so unknown routes return the {ok:false,...} envelope rather
 // than Express's default HTML page.
