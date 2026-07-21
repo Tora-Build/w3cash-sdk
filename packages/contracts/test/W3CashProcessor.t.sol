@@ -92,6 +92,18 @@ contract MockNativeSink is IActionAdapter {
     }
 }
 
+/// @dev Hostile token: transferFrom returns junk (10 bytes, not a clean 32-byte bool). A raw
+/// abi.decode(ret,(bool)) would revert — the tolerant tip check (audit M2) must treat it as failure.
+contract MockDirtyReturnToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transferFrom(address, address, uint256) external pure returns (bytes10) {
+        return bytes10(0x00112233445566778899); // 10 bytes of junk
+    }
+}
+
 interface IProcessorFlash {
     function onFlashLoan(address asset, uint256 amount, uint256 premium, bytes calldata cb) external returns (bytes4);
 }
@@ -578,7 +590,7 @@ contract W3CashProcessorTest is Test {
             _tipBundle(address(tip), 50, keeper);
         proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
         assertEq(tip.balanceOf(keeper), 50);
-        (uint128 tipSpent, ) = proc.tipSpent(proc.grantDigest(g), address(tip));
+        (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
         assertEq(tipSpent, 50);
     }
 
@@ -602,9 +614,43 @@ contract W3CashProcessorTest is Test {
             _tipBundle(address(tip), 50, address(0xBEEF));
         proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
         assertEq(tip.balanceOf(address(0xBEEF)), 0);        // tip not paid
-        (uint128 tipSpent, ) = proc.tipSpent(proc.grantDigest(g), address(tip));
+        (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
         assertEq(tipSpent, 0);                              // reserve refunded (item 10)
         assertEq(proc.executionsOf(proc.intentDigest(it)), 1); // action still ran
+    }
+
+    /// Audit M2: a tip token whose transferFrom returns non-standard (10-byte) junk must NOT brick
+    /// the protective action — the tolerant decode treats it as a failed tip and continues.
+    function test_Tip_DirtyReturn_DoesNotBrick() public {
+        MockDirtyReturnToken tip = new MockDirtyReturnToken();
+        tip.mint(root, 1e21);
+        vm.prank(root); tip.approve(address(proc), type(uint256).max);
+        ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
+            _tipBundle(address(tip), 50, address(0xBEEF));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
+        assertEq(tipSpent, 0);                                  // reserve refunded (dirty return => not paid)
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 1);  // protective action still ran
+    }
+
+    /// Audit M1: tip shares the action cap cursor — total outflow of a token stays <= cap.
+    function test_Tip_SharesActionCap() public {
+        // action spends 600 of TOKEN; a tip of 50 in TOKEN shares the same cap(1000) cursor.
+        address keeper = address(0xBEEF);
+        W3CashProcessor.Policy memory p = _policy(1000, 0);
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = _ops(true, 600, false);
+        W3CashProcessor.Intent memory it = W3CashProcessor.Intent({
+            session: proc.grantDigest(g), opsHash: keccak256(abi.encode(ops)),
+            deadline: uint64(block.timestamp + 1 days), maxRuns: 1, cooldown: 0,
+            epoch: proc.epoch(root), salt: keccak256("tip-shared"),
+            tipToken: TOKEN, tipAmount: 50, keeperOfRecord: keeper
+        });
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
+        assertEq(spent, 650);              // 600 action + 50 tip, ONE shared cursor (not 2x)
+        assertEq(erc.balanceOf(keeper), 50);
     }
 
     // --- Item 11: PostConditionAdapter (integration) --------------------

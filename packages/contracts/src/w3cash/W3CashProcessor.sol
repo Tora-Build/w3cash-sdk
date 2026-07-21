@@ -186,8 +186,7 @@ contract W3CashProcessor is EIP712 {
     struct IntentState { uint32 executions; uint40 lastExecuted; bool cancelled; }
 
     mapping(bytes32 => Session) public sessions;                              // key = grant digest
-    mapping(bytes32 => mapping(address => CapCursor)) public spentByToken;    // (grant, token) — persistent
-    mapping(bytes32 => mapping(address => CapCursor)) public tipSpent;        // (grant, tipToken) — dedicated
+    mapping(bytes32 => mapping(address => CapCursor)) public spentByToken;    // (grant, token) — actions AND tip share this
     mapping(bytes32 => IntentState) public intentState;                      // key = intent digest
     mapping(address => uint256) public epoch;                                // root cancel-ALL
 
@@ -408,15 +407,16 @@ contract W3CashProcessor is EIP712 {
                     // Flash initiator: dedicated allowlist; principal comes from the pool, NOT root.
                     if (!_codehashIn(p.flashCodehashes, op.target)) revert PolicyDenied();
                     if (op.funding != FundingMode.NONE) revert PolicyDenied();
+                    if (op.value != 0) revert PolicyDenied();             // no native on a flash op (audit L3)
                 } else {
                     if (!_codehashIn(p.allowedCodehashes, op.target)) revert PolicyDenied();
                     if (_adapterKind(op.target) != KIND_ACTION) revert PolicyDenied();
-                    // Root-sourced funded ops must name a capped token; a NONE-funded action must NOT name a
-                    // fundToken (else it looks funded but is never reserved — an uncounted-pull footgun).
-                    if (op.funding == FundingMode.PERMIT2) {
-                        if (maxRuns != 1) revert PermitRecurring();          // one-shot SignatureTransfer only (item 9)
-                        if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
-                    } else if (op.funding == FundingMode.STANDING) {
+                    // Root-sourced funded ops must name a capped ERC20 (native is caller/frame-supplied,
+                    // never a root pull); a NONE-funded action must NOT name a fundToken (else it looks
+                    // funded but is never reserved — an uncounted-pull footgun).
+                    if (op.funding == FundingMode.PERMIT2 || op.funding == FundingMode.STANDING) {
+                        if (op.fundToken == address(0) || op.fundToken == NATIVE) revert PolicyDenied(); // audit I2
+                        if (op.funding == FundingMode.PERMIT2 && maxRuns != 1) revert PermitRecurring();  // one-shot only (item 9)
                         if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
                     } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
                         revert PolicyDenied();
@@ -655,14 +655,16 @@ contract W3CashProcessor is EIP712 {
         uint256 idx = _capIndex(p, it.tipToken);
         if (idx == NONE) { emit TipSkipped(iDigest, "TIP_UNCAPPED"); return; } // degrade to untipped, never revert
         TokenCap calldata cap = p.caps[idx];
-        CapCursor storage c = tipSpent[gDigest][it.tipToken];
+        // Meter the tip against the SAME per-token cursor as actions so total outflow of tipToken
+        // stays <= cap (audit M1 — no 2x doubling). The tip clamps to whatever room actions left.
+        CapCursor storage c = spentByToken[gDigest][it.tipToken];
         if (cap.resetPeriod != 0 && block.timestamp >= uint256(c.lastReset) + cap.resetPeriod) {
             c.spent = 0; c.lastReset = uint40(block.timestamp);
         }
         uint256 room = cap.cap > c.spent ? cap.cap - c.spent : 0;
         uint256 pay = it.tipAmount < room ? it.tipAmount : room; // clamp
         if (pay == 0) { emit TipSkipped(iDigest, "NO_ROOM"); return; }
-        c.spent = uint128(uint256(c.spent) + pay);                 // reserve (dedicated sub-budget)
+        c.spent = uint128(uint256(c.spent) + pay);                 // reserve (SHARED cap cursor — audit M1)
         address to = it.keeperOfRecord != address(0) ? it.keeperOfRecord : msg.sender;
         // Gas-capped, best-effort pull from root's standing tipToken allowance to the keeper. On any
         // failure (dry allowance, malicious/hostile token, OOG) REFUND the reserve and continue —
@@ -670,7 +672,15 @@ contract W3CashProcessor is EIP712 {
         (bool ok, bytes memory ret) = it.tipToken.call{ gas: TIP_GAS_CAP }(
             abi.encodeWithSelector(IERC20.transferFrom.selector, root, to, pay)
         );
-        bool paid = ok && (ret.length == 0 || abi.decode(ret, (bool)));
+        // Tolerant success check: a non-standard return must NOT revert the whole protective intent
+        // (audit M2). Decode as uint256 (never reverts on a bad bool) and require exactly 1; a short
+        // return, a 32-byte non-`true` word, or an empty return-with-failure => not paid. Only a
+        // 0-length return (success by convention) or a clean word==1 counts as paid.
+        bool paid;
+        if (ok) {
+            if (ret.length == 0) paid = true;
+            else if (ret.length == 32) paid = (abi.decode(ret, (uint256)) == 1);
+        }
         if (!paid) {
             c.spent = uint128(uint256(c.spent) - pay);            // reserve-then-refund (item 10)
             emit TipSkipped(iDigest, "TRANSFER_FAILED");
