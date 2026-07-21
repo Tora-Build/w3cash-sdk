@@ -65,6 +65,21 @@ contract MockSwapAction is IActionAdapter {
     }
 }
 
+interface IProcessorFlash {
+    function onFlashLoan(address asset, uint256 amount, uint256 premium, bytes calldata cb) external returns (bytes4);
+}
+
+/// @dev Adapter-as-receiver flash mock: on initiateFlash (called by the processor) it forwards the
+/// principal to the processor, runs the callback, and is repaid principal+premium (premium 0 here).
+contract MockFlashAdapter {
+    function verb() external pure returns (uint32) { return 1 << 6; } // VERB_FLASH
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function initiateFlash(address asset, uint256 amount, bytes calldata, bytes calldata cb) external {
+        MockERC20(asset).transfer(msg.sender, amount);              // principal → processor
+        IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb); // processor repays us inside
+    }
+}
+
 contract W3CashProcessorTest is Test {
     W3CashProcessor internal proc;
     MockPermit2 internal permit2;
@@ -105,6 +120,7 @@ contract W3CashProcessorTest is Test {
         p.allowedCodehashes[0] = address(action).codehash;
         p.gateCodehashes = new bytes32[](1);
         p.gateCodehashes[0] = address(gate).codehash;
+        p.flashCodehashes = new bytes32[](0);
         p.verbMask = proc.VERB_TRANSFER();
         p.caps = new W3CashProcessor.TokenCap[](1);
         p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: cap, resetPeriod: resetPeriod });
@@ -228,6 +244,7 @@ contract W3CashProcessorTest is Test {
         p.allowedCodehashes[1] = address(sink).codehash;
         p.gateCodehashes = new bytes32[](1);
         p.gateCodehashes[0] = address(gate).codehash;
+        p.flashCodehashes = new bytes32[](0);
         p.verbMask = 1 << 1; // VERB_SWAP
         p.caps = new W3CashProcessor.TokenCap[](1);
         p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 1000, resetPeriod: 0 });
@@ -346,5 +363,58 @@ contract W3CashProcessorTest is Test {
         vm.warp(block.timestamp + 2);
         proc.execute(g, rootSig, p, it, ops, sessSig);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 2);
+    }
+
+    /// Item-7 golden vector: a flash of X=1000 with an asset cap of only 100 SUCCEEDS and debits the
+    /// cap by 0 — the borrowed principal round-trips through the frame, never touching root or the cap.
+    function test_FlashFrame_BorrowRoundTrips_CapUntouched() public {
+        MockFlashAdapter flash = new MockFlashAdapter();
+        MockSwapAction swap = new MockSwapAction(TOKEN, 1000); // round-trips the 1000 it is fed
+        erc.mint(address(flash), 1000);                        // the pool's lendable inventory
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1);
+        p.allowedCodehashes[0] = address(swap).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](1);
+        p.flashCodehashes[0] = address(flash).codehash;
+        p.verbMask = (1 << 6) | (1 << 1); // VERB_FLASH | VERB_SWAP
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 100, resetPeriod: 0 }); // 100 << 1000
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+
+        // sub-group: one THREADED op draws 1000 TOKEN and pushes it to the round-trip swap.
+        W3CashProcessor.Op[] memory subOps = new W3CashProcessor.Op[](1);
+        subOps[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(swap), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: TOKEN, fundAmount: 1000,
+            outToken: TOKEN, fundingParams: "", data: ""
+        });
+
+        // flash op: verb VERB_FLASH, funding NONE; data = (asset, amount, poolParams, subOpsBytes).
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(flash), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "",
+            data: abi.encode(TOKEN, uint256(1000), bytes(""), abi.encode(subOps))
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+
+        (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
+        assertEq(spent, 0);                            // cap untouched — the flash never pulled root
+        assertEq(erc.balanceOf(address(flash)), 1000); // pool made whole (repaid)
+        assertEq(erc.balanceOf(address(proc)), 0);     // no residual held by the processor
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 1);
+    }
+
+    /// F1/F2: the flash callback is only reachable by the transiently-pinned adapter — an out-of-band
+    /// caller (no flash in flight → pin is address(0)) is rejected.
+    function test_FlashCallback_RejectsUnpinnedCaller() public {
+        vm.expectRevert(W3CashProcessor.NotExpectedAdapter.selector);
+        proc.onFlashLoan(TOKEN, 1000, 0, "");
     }
 }

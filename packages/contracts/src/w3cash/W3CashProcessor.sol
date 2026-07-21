@@ -19,11 +19,14 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *      reserve (reserve-before-every-pull, CEI), the multi-mode funding descriptor,
  *      Permit2/STANDING root pull + actual-delta metering, the SOLE-MOVER push-then-
  *      measure adapter feed, THREADED frame draw + measured-output frame credit, three
- *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip.
- *      REMAINING (marked `NOTE(freeze):`) — the controlled-callback flash frame
- *      (adapter-as-receiver + opsHash-bound sub-group, items 7); frame-sourced native
- *      value (item 8); the on-chain hardening cluster (item 9); and the Permit2 WITNESS
- *      typestring + per-chain golden vectors (item 12). NOT a deployable build yet.
+ *      revocation tiers, ERC-1271 root, native pause-refund, clamp-and-meter tip, and
+ *      the controlled-callback flash frame (item 7 — adapter-as-receiver [F2] +
+ *      opsHash-bound sub-group + transient expected-adapter pin + single-use slot +
+ *      zero-on-exit [F1]; THREADED-only sub-ops so the callback needs no policy/cap).
+ *      REMAINING (marked `NOTE(freeze):`) — frame-sourced native value (item 8); the
+ *      on-chain hardening cluster (item 9); a root-sourced flash premium/shortfall
+ *      top-up (deferred — strategies self-fund the repay today); and the Permit2
+ *      WITNESS typestring + per-chain golden vectors (item 12). NOT deployable yet.
  *
  * Invariants preserved from the substrate (see DECISIONS.md ADR-0001):
  *   (1) PAUSE→resume: a failed gate returns before ANY state write; re-submitting the
@@ -68,6 +71,11 @@ contract W3CashProcessor is EIP712 {
     error ValueNotConserved();
     error TooManyEntries();
     error NativeRefundFailed();
+    error NotExpectedAdapter();  // flash callback caller != the transiently-pinned adapter
+    error FlashSlotConsumed();   // a second flash sub-group was attempted in one frame
+    error NestedFlash();         // a flash sub-op is itself a flash op (no nesting)
+    error SubGroupMismatch();    // callback sub-group hash != the dispatch-bound hash
+    error RepayShortfall();      // frame can't cover principal + premium at repay
 
     // ---------------------------------------------------------------------
     // Constants
@@ -86,6 +94,7 @@ contract W3CashProcessor is EIP712 {
     uint32 public constant VERB_WRAP     = 1 << 3;
     uint32 public constant VERB_BRIDGE   = 1 << 4;
     uint32 public constant VERB_TIP      = 1 << 5;
+    uint32 public constant VERB_FLASH    = 1 << 6; // controlled flash sub-group initiator
 
     // EIP-712 typehashes. epoch is an explicit field of BOTH structs (Addendum C #9) so a
     // Tier-3 incrementEpoch() invalidates grant AND intent digests directly.
@@ -113,6 +122,7 @@ contract W3CashProcessor is EIP712 {
     struct Policy {
         bytes32[] allowedCodehashes; // codehash-pin (Addendum C #3); EMPTY = DENY ALL (fail-closed)
         bytes32[] gateCodehashes;    // GATE adapter allowlist (read-only condition adapters)
+        bytes32[] flashCodehashes;   // DEDICATED flash-adapter allowlist (Addendum D item 7)
         uint32    verbMask;          // permitted action verbs; 0 = deny all
         TokenCap[] caps;             // per-token budgets; token absent => DENIED
     }
@@ -170,6 +180,8 @@ contract W3CashProcessor is EIP712 {
     uint256 private constant _T_TOUCH_LEN = uint256(keccak256("w3cash.v2.touchLen"));
     bytes32 private constant _T_TOUCH_BASE = keccak256("w3cash.v2.touchToken");
     bytes32 private constant _T_FRAME_BASE = keccak256("w3cash.v2.frameReceived");
+    uint256 private constant _T_FLASH_ADAPTER = uint256(keccak256("w3cash.v2.flashAdapter")); // pinned callback caller (F1)
+    uint256 private constant _T_FLASH_CTX = uint256(keccak256("w3cash.v2.flashCtx"));         // keccak(root,subOps) bind (F1)
 
     // ---------------------------------------------------------------------
     // Events
@@ -249,10 +261,14 @@ contract W3CashProcessor is EIP712 {
         uint256 forwarded;
         for (uint256 i = boundary; i < ops.length; ++i) {
             Op calldata op = ops[i];
-            // Reserve (root-sourced) or draw (threaded) the input; returns the amount to push.
-            uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest);
             forwarded += op.value;
-            _feedAndRun(op, root, fed); // push input to the adapter, run, credit measured output to the frame
+            if (_adapterVerb(op.target) & VERB_FLASH != 0) {
+                _runFlashOp(policy, op, root); // controlled-callback flash sub-group (item 7)
+            } else {
+                // Reserve (root-sourced) or draw (threaded) the input; returns the amount to push.
+                uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest);
+                _feedAndRun(op, root, fed);
+            }
         }
 
         // 8. RIDER-1 tip — clamp-and-meter against the DEDICATED tip sub-budget (Addendum C #8).
@@ -361,15 +377,22 @@ contract W3CashProcessor is EIP712 {
                 if (_adapterKind(op.target) != KIND_GATE) revert PolicyDenied(); // belt-and-suspenders (fail-closed)
             } else {
                 if (!seenAction) { seenAction = true; boundary = i; } // first ACTION marks the boundary
-                if (!_codehashIn(p.allowedCodehashes, op.target)) revert PolicyDenied();
-                if (_adapterKind(op.target) != KIND_ACTION) revert PolicyDenied();
-                if (_adapterVerb(op.target) & p.verbMask == 0) revert PolicyDenied(); // verb from adapter
-                // Root-sourced funded ops must name a capped token; a NONE-funded action must NOT name a
-                // fundToken (else it looks funded but is never reserved — an uncounted-pull footgun).
-                if (op.funding == FundingMode.PERMIT2 || op.funding == FundingMode.STANDING) {
-                    if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
-                } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
-                    revert PolicyDenied();
+                uint32 v = _adapterVerb(op.target);                   // verb from the pinned adapter
+                if (v & p.verbMask == 0) revert PolicyDenied();
+                if (v & VERB_FLASH != 0) {
+                    // Flash initiator: dedicated allowlist; principal comes from the pool, NOT root.
+                    if (!_codehashIn(p.flashCodehashes, op.target)) revert PolicyDenied();
+                    if (op.funding != FundingMode.NONE) revert PolicyDenied();
+                } else {
+                    if (!_codehashIn(p.allowedCodehashes, op.target)) revert PolicyDenied();
+                    if (_adapterKind(op.target) != KIND_ACTION) revert PolicyDenied();
+                    // Root-sourced funded ops must name a capped token; a NONE-funded action must NOT name a
+                    // fundToken (else it looks funded but is never reserved — an uncounted-pull footgun).
+                    if (op.funding == FundingMode.PERMIT2 || op.funding == FundingMode.STANDING) {
+                        if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
+                    } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
+                        revert PolicyDenied();
+                    }
                 }
                 if (op.value != 0 && _capIndex(p, address(0)) == NONE) revert TokenNotCapped(); // native cap (Addendum C #11)
             }
@@ -456,7 +479,7 @@ contract W3CashProcessor is EIP712 {
     /// @dev Push the fed input to the codehash-pinned adapter, run it, and credit the MEASURED output
     /// delta to the frame ledger for downstream THREADED ops. SOLE-MOVER: the adapter is a pure
     /// function of pushed tokens + value + data and cannot reach root funds.
-    function _feedAndRun(Op calldata op, address root, uint256 fed) internal {
+    function _feedAndRun(Op memory op, address root, uint256 fed) internal {
         if (op.fundToken != address(0) && fed > 0) {
             IERC20(op.fundToken).safeTransfer(op.target, fed);
         }
@@ -466,6 +489,91 @@ contract W3CashProcessor is EIP712 {
             uint256 outAfter = IERC20(op.outToken).balanceOf(address(this));
             if (outAfter > outBefore) _frameCredit(op.outToken, outAfter - outBefore);
         }
+    }
+
+    /// @dev Draw a THREADED input from the frame ledger (never counts vs. the cap). Used inside the
+    /// flash sub-group; the top-level path uses the THREADED branch of _reserveAndFund.
+    function _drawThreaded(Op memory op) internal returns (uint256 fed) {
+        uint256 avail = _frameGet(op.fundToken);
+        fed = op.fundAmount == CONTRACT_BALANCE ? avail : op.fundAmount;
+        if (avail < fed) revert InsufficientFrameBalance();
+        _frameSet(op.fundToken, avail - fed);
+    }
+
+    // ---------------------------------------------------------------------
+    // Controlled-callback flash frame (Addendum D item 7 — F1 + F2)
+    // ---------------------------------------------------------------------
+
+    /// @dev DISPATCH a flash op. The sub-group lives in op.data (so the signed opsHash binds it).
+    /// We validate it, then pin the expected callback adapter + the sub-group hash transiently and
+    /// call the ADAPTER (which owns all pool ABI — F2). Sub-ops are THREADED-only, so the re-entrant
+    /// callback needs no policy/cap access.
+    function _runFlashOp(Policy calldata policy, Op calldata op, address root) internal {
+        (address asset, uint256 amount, bytes memory poolParams, bytes memory subOpsBytes) =
+            abi.decode(op.data, (address, uint256, bytes, bytes));
+        Op[] memory subOps = abi.decode(subOpsBytes, (Op[]));
+        _checkSubGroup(policy, subOps);
+
+        bytes memory cb = abi.encode(root, asset, amount, subOpsBytes);
+        _tstore(_T_FLASH_ADAPTER, uint256(uint160(op.target))); // F1: pin the exact callback caller
+        _tstore(_T_FLASH_CTX, uint256(keccak256(cb)));          // F1: bind the sub-group
+        IFlashAdapter(op.target).initiateFlash(asset, amount, poolParams, cb);
+        _tstore(_T_FLASH_ADAPTER, 0);
+        _tstore(_T_FLASH_CTX, 0);
+    }
+
+    /// @dev Validate a flash sub-group at dispatch (policy in scope). Actions only, THREADED-only
+    /// (frame-sourced), no nested flash, codehash-pinned + verb-allowed.
+    function _checkSubGroup(Policy calldata p, Op[] memory subOps) internal view {
+        uint256 n = subOps.length;
+        if (n > MAX_TARGETS) revert TooManyEntries();
+        for (uint256 i = 0; i < n; ++i) {
+            Op memory s = subOps[i];
+            if (s.kind != OpKind.ACTION) revert PolicyDenied();
+            if (s.funding != FundingMode.THREADED) revert PolicyDenied();
+            uint32 v = _adapterVerb(s.target);
+            if (v & VERB_FLASH != 0) revert NestedFlash();
+            if (v & p.verbMask == 0) revert PolicyDenied();
+            if (!_codehashIn(p.allowedCodehashes, s.target)) revert PolicyDenied();
+            if (_adapterKind(s.target) != KIND_ACTION) revert PolicyDenied();
+        }
+    }
+
+    /// @notice The controlled flash callback — re-entered ONLY by the pinned flash adapter, ONCE,
+    /// at depth 1. The adapter has already forwarded `amount` of `asset` to this processor.
+    function onFlashLoan(address asset, uint256 amount, uint256 premium, bytes calldata cb)
+        external
+        returns (bytes4)
+    {
+        if (msg.sender != address(uint160(_tload(_T_FLASH_ADAPTER)))) revert NotExpectedAdapter(); // F1/F2
+        if (_tload(_T_FLASH) != 0) revert FlashSlotConsumed();  // single sub-group per frame
+        if (_tload(_T_DEPTH) != 1) revert Reentrancy();
+        if (uint256(keccak256(cb)) != _tload(_T_FLASH_CTX)) revert SubGroupMismatch();
+        _tstore(_T_FLASH, 1);   // consume the single-use slot
+        _tstore(_T_DEPTH, 2);   // enter the sub-group frame
+
+        (address root, address cbAsset, uint256 cbAmount, bytes memory subOpsBytes) =
+            abi.decode(cb, (address, address, uint256, bytes));
+        if (cbAsset != asset || cbAmount != amount) revert SubGroupMismatch();
+
+        _frameCredit(asset, amount); // the borrowed principal now lives in the frame
+
+        Op[] memory subOps = abi.decode(subOpsBytes, (Op[]));
+        for (uint256 i = 0; i < subOps.length; ++i) {
+            Op memory s = subOps[i];
+            uint256 fed = _drawThreaded(s);       // reserve-before-pull is N/A: frame-sourced, cap-exempt
+            _feedAndRun(s, root, fed);
+        }
+
+        // Repay principal + premium to the adapter, FULLY from the frame (self-funding strategy).
+        uint256 repay = amount + premium;
+        uint256 avail = _frameGet(asset);
+        if (avail < repay) revert RepayShortfall();
+        _frameSet(asset, avail - repay);
+        IERC20(asset).safeTransfer(msg.sender, repay);
+
+        _tstore(_T_DEPTH, 1); // exit the sub-group frame
+        return this.onFlashLoan.selector;
     }
 
     function _reserveCap(bytes32 gDigest, Policy calldata p, address token, uint256 amount, bytes32 iDigest) internal {
@@ -564,6 +672,8 @@ contract W3CashProcessor is EIP712 {
         }
         _tstore(_T_TOUCH_LEN, 0);
         _tstore(_T_FLASH, 0);
+        _tstore(_T_FLASH_ADAPTER, 0);
+        _tstore(_T_FLASH_CTX, 0);
         _tstore(_T_DEPTH, 0);
     }
 
@@ -628,4 +738,10 @@ interface ISignatureTransfer {
         string calldata witnessTypeString,
         bytes calldata signature
     ) external;
+}
+
+/// @notice Flash-loan adapter (adapter-as-receiver, F2). Owns ALL pool ABI. On the pool callback it
+/// forwards the principal to the processor and calls processor.onFlashLoan(...), then repays the pool.
+interface IFlashAdapter {
+    function initiateFlash(address asset, uint256 amount, bytes calldata poolParams, bytes calldata callbackData) external;
 }
