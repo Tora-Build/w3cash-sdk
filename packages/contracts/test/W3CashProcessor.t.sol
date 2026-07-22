@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { W3CashProcessor, IGateAdapter, IActionAdapter, ISignatureTransfer } from "../src/w3cash/W3CashProcessor.sol";
 import { PostConditionAdapter } from "../src/w3cash/adapters/PostConditionAdapter.sol";
+import { ECDSA as ECDSAlib } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 // --- Mocks --------------------------------------------------------------
 
@@ -128,6 +129,26 @@ contract MockDoubleFlashAdapter {
         MockERC20(asset).transfer(msg.sender, amount);
         IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb);
         IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb); // second => must revert
+    }
+}
+
+/// @dev Minimal ERC-1271 smart-account root: validates a signature by recovering it (via OZ's
+/// checker path, i.e. plain ECDSA over the passed EIP-712 digest) to its owner. Models a standard
+/// EIP-712-aware smart account (e.g. Safe); an ERC-7739 account would additionally nest, which the
+/// verifier supports by passing the opaque signature through.
+contract MockSmartAccount {
+    address public owner;
+    constructor(address _owner) { owner = _owner; }
+    function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
+        (address rec, , ) = ECDSAlib.tryRecover(hash, sig);
+        return rec == owner ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
+    }
+}
+
+/// @dev A 1271 account that returns the WRONG magic — must be rejected (BadRootSig).
+contract MockBadAccount {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return bytes4(0xdeadbeef);
     }
 }
 
@@ -901,5 +922,67 @@ contract W3CashProcessorTest is Test {
             proc.permit2WitnessTypeString(),
             "bytes32 witness)TokenPermissions(address token,uint256 amount)"
         );
+    }
+
+    // --- ERC-7739 / ERC-1271 smart-account root -------------------------
+
+    /// A smart-account (ERC-1271) root is accepted via SignatureChecker: the account validates the
+    /// domain-bound grant digest against its owner. (An ERC-7739 account additionally nests; the
+    /// verifier supports it by passing the opaque signature through unchanged.)
+    function test_ERC1271_SmartAccountRoot_Accepts() public {
+        (address owner, uint256 ownerPk) = makeAddrAndKey("sa-owner");
+        MockSmartAccount sa = new MockSmartAccount(owner);
+        // Fund the smart-account root + approve the processor for the STANDING pull.
+        erc.mint(address(sa), 1e24);
+        vm.prank(address(sa)); erc.approve(address(proc), type(uint256).max);
+
+        W3CashProcessor.Policy memory p = _policy(1000, 0);
+        W3CashProcessor.SessionGrant memory g = W3CashProcessor.SessionGrant({
+            root: address(sa), sessionKey: sessionKey, expiry: uint40(block.timestamp + 30 days),
+            policyHash: keccak256(abi.encode(p)), epoch: proc.epoch(address(sa)), salt: keccak256("sa-grant")
+        });
+        W3CashProcessor.Op[] memory ops = _ops(true, 600, false);
+        W3CashProcessor.Intent memory it = W3CashProcessor.Intent({
+            session: proc.grantDigest(g), opsHash: keccak256(abi.encode(ops)),
+            deadline: uint64(block.timestamp + 1 days), maxRuns: 1, cooldown: 0,
+            epoch: proc.epoch(address(sa)), salt: keccak256("sa-intent"),
+            tipToken: address(0), tipAmount: 0, keeperOfRecord: address(0)
+        });
+        // Root "signature" = the account OWNER's ECDSA over the grant digest (what the account checks).
+        bytes memory rootSig = _sign(ownerPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 1);
+        assertEq(erc.balanceOf(address(action)), 600); // funds pulled from the smart-account root
+    }
+
+    /// A 1271 account returning the wrong magic value is rejected (BadRootSig).
+    function test_ERC1271_WrongMagic_Rejected() public {
+        MockBadAccount bad = new MockBadAccount();
+        W3CashProcessor.Policy memory p = _policy(1000, 0);
+        W3CashProcessor.SessionGrant memory g = W3CashProcessor.SessionGrant({
+            root: address(bad), sessionKey: sessionKey, expiry: uint40(block.timestamp + 30 days),
+            policyHash: keccak256(abi.encode(p)), epoch: proc.epoch(address(bad)), salt: keccak256("bad")
+        });
+        W3CashProcessor.Op[] memory ops = _ops(true, 600, false);
+        W3CashProcessor.Intent memory it = W3CashProcessor.Intent({
+            session: proc.grantDigest(g), opsHash: keccak256(abi.encode(ops)),
+            deadline: uint64(block.timestamp + 1 days), maxRuns: 1, cooldown: 0,
+            epoch: proc.epoch(address(bad)), salt: keccak256("bad-i"),
+            tipToken: address(0), tipAmount: 0, keeperOfRecord: address(0)
+        });
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+        vm.expectRevert(W3CashProcessor.BadRootSig.selector);
+        proc.execute(g, "0x", p, it, ops, sessSig);
+    }
+
+    /// The ERC-7739 support surface is exposed (domain via ERC-5267 + contents types).
+    function test_ERC7739_SupportSurface() public view {
+        (, string memory name, string memory version, , , , ) = proc.eip712Domain();
+        assertEq(name, "W3Cash");
+        assertEq(version, "2");
+        assertEq(bytes(proc.grantContentsType()).length > 0, true);
+        assertEq(bytes(proc.intentContentsType()).length > 0, true);
     }
 }

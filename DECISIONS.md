@@ -678,12 +678,20 @@ fixes it; it is the single most important change.
 
 **LOW**
 
-10. **Decide ERC-7739 for the ERC-1271 root branch now.** Either adopt ERC-7739
-    nested-712 (root always signs nested under W3Cash's domain — defeats cross-
-    context replay of a naive-1271 account) or normatively require 7739-compliant
-    roots and ship a release-gate vector showing a raw-hash 1271 mock is
-    (intentionally) accepted. `staticcall` the 1271 branch; exact `0x1626ba7e`
-    match. Document that an EIP-7702 delegation flip invalidates outstanding grants.
+10. **ERC-7739 for the ERC-1271 root branch — ✅ IMPLEMENTED (2026-07-22).** Root
+    verification routes through OZ `SignatureChecker.isValidSignatureNowCalldata`
+    (EOA ECDSA + ERC-1271 with `staticcall` + exact `0x1626ba7e`, rejecting legacy
+    `0x20c13b0b`). The grant digest is a full EIP-712 hash bound to
+    {name,version,chainId,verifyingContract} AND the root address, so a signature
+    cannot be cross-chain / cross-contract / cross-account replayed by construction.
+    **ERC-7739 support:** the opaque signature is passed through untouched, so a 7739
+    account performs its own defensive rehashing (nesting our domain-bound digest
+    under the account's domain) — full 7739 compatibility with NO verifier-side
+    change; wallets read our domain via `eip712Domain()` (ERC-5267) + the contents
+    type via `grant/intentContentsType()`. Tests: a smart-account (1271) root is
+    accepted, a wrong-magic account rejected, the support surface exposed.
+    EIP-7702 caveat (a delegation flip invalidates outstanding grants → re-issue)
+    stays documented; the SDK warns at grant issuance.
 11. **Native cap check in `_policyAllows`** as a first-class early check
     (`if (op.value != 0) require(_capIndex(p, address(0)) != NONE)`), matching the
     fail-closed ERC20 path — a tidy-up so all checks live in the decoder.

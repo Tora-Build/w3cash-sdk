@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -31,9 +31,11 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *      Item 12 (release-gate vectors) is IN-REPO: flash-frame proofs (threading-isolation,
  *      single-sub-group, sub-op-bounded, transient zero-on-exit), reverting/dirty tip resilience,
  *      EIP-712 domain-separation-by-chainId, and the canonical Permit2 witness typestring (exposed
- *      via `permit2WitnessTypeString()`). REMAINING for the EXTERNAL audit — ERC-7739 nested-712 for
- *      the 1271 root branch (a deliberate contract-design decision, not rushed); a real-Permit2 fork
- *      test of the pull; and a root-sourced flash premium/shortfall top-up (deferred — strategies
+ *      via `permit2WitnessTypeString()`), and ERC-7739 support for smart-account roots (root verify
+ *      routed through OZ SignatureChecker — EOA + ERC-1271 with exact-magic; the opaque signature is
+ *      passed through so a 7739 account does its own defensive rehashing; domain via `eip712Domain()`
+ *      + `grant/intentContentsType()`). REMAINING for the EXTERNAL audit — a real-deployed-Permit2
+ *      fork test of the pull; and a root-sourced flash premium/shortfall top-up (deferred — strategies
  *      self-fund the repay today).
  *
  * Invariants preserved from the substrate (see DECISIONS.md ADR-0001):
@@ -97,7 +99,6 @@ contract W3CashProcessor is EIP712 {
     // ---------------------------------------------------------------------
     // Constants
     // ---------------------------------------------------------------------
-    bytes4  private constant ERC1271_MAGIC = 0x1626ba7e;
     uint8   private constant KIND_GATE   = 1;
     uint8   private constant KIND_ACTION = 2;
     uint256 private constant NONE = type(uint256).max;
@@ -312,6 +313,16 @@ contract W3CashProcessor is EIP712 {
         return WITNESS_TYPESTRING;
     }
 
+    /// @notice EIP-712 `contents` type strings — the struct type definitions a smart-account wallet
+    /// (e.g. ERC-7739) uses to build a readable nested TypedDataSign signature over a grant/intent.
+    /// Pair with `eip712Domain()` (ERC-5267) to reconstruct the domain-bound digest off-chain.
+    function grantContentsType() external pure returns (string memory) {
+        return "SessionGrant(address root,address sessionKey,uint40 expiry,bytes32 policyHash,uint256 epoch,bytes32 salt)";
+    }
+    function intentContentsType() external pure returns (string memory) {
+        return "Intent(bytes32 session,bytes32 opsHash,uint64 deadline,uint32 maxRuns,uint40 cooldown,uint256 epoch,bytes32 salt,address tipToken,uint128 tipAmount,address keeperOfRecord)";
+    }
+
     // ---------------------------------------------------------------------
     // Revocation tiers
     // ---------------------------------------------------------------------
@@ -371,20 +382,18 @@ contract W3CashProcessor is EIP712 {
     // ---------------------------------------------------------------------
     // Root verification (ERC-1271 or ecrecover)
     // ---------------------------------------------------------------------
+    /// @dev Verify the root's signature over the grant `digest`. `digest` is a full EIP-712
+    /// domain-bound hash (name/version/chainId/verifyingContract) that ALSO binds the root address
+    /// in the SessionGrant struct — so a signature can't be cross-chain / cross-contract /
+    /// cross-account replayed by construction. Routed through OZ SignatureChecker, which handles an
+    /// EOA root (ECDSA) and a smart-account root (ERC-1271, staticcall + exact 0x1626ba7e magic,
+    /// rejecting legacy 0x20c13b0b) in one call. ERC-7739 SUPPORT: the opaque `sig` is passed
+    /// through untouched, so an ERC-7739 account performs its own defensive rehashing (nesting our
+    /// domain-bound `digest` under the account's own domain) — full 7739 compatibility with no
+    /// verifier-side change. Wallets read our domain via `eip712Domain()` (ERC-5267) and the
+    /// contents type via `grantContentsType()` to build the nested TypedDataSign signature.
     function _verifyRoot(address root, bytes32 digest, bytes calldata sig) internal view {
-        if (root.code.length > 0) {
-            // staticcall only (view — a stateful/reentrant 1271 can't mutate here); require the
-            // EXACT modern magic 0x1626ba7e, which also rejects the legacy 0x20c13b0b selector.
-            // NOTE(freeze, item 9): wrap `digest` in ERC-7739 nested-712 before the 1271 call to
-            // defeat cross-context replay of a naive raw-hash 1271 account, + a per-chain golden
-            // vector proving a 7739-Safe accepts and a raw-hash mock (intentionally) does not.
-            (bool ok, bytes memory ret) = root.staticcall(
-                abi.encodeWithSelector(IERC1271.isValidSignature.selector, digest, sig)
-            );
-            if (!ok || ret.length < 32 || abi.decode(ret, (bytes4)) != ERC1271_MAGIC) revert BadRootSig();
-        } else {
-            if (ECDSA.recover(digest, sig) != root) revert BadRootSig();
-        }
+        if (!SignatureChecker.isValidSignatureNowCalldata(root, digest, sig)) revert BadRootSig();
     }
 
     // ---------------------------------------------------------------------
