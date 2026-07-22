@@ -287,8 +287,14 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
     tool (disclosure of chains + default), and `X-Payment-Network` echo on the paid response.
     *(Deferred: fail-hard-not-FREE on total facilitator outage + consumed-`(nonce,network)`
     tracking — kept fail-open-to-FREE for uptime; revisit with the ladder in item 15.)*
-17. `[off]` **Intent status + neutral telemetry** — CF Workers cron-indexer over chain
-    events (84532/1952), reliability stats from a reproducible on-chain denominator.
+17. `[off]` **Intent status + neutral telemetry** ✅ (scaffold) — `apps/telemetry/` CF Worker + D1:
+    cron-indexer over the deployed processor's events (84532/1952/196, paged for X Layer's 100-block
+    `eth_getLogs` cap, idempotent, resumable); read-only `GET /intent/:hash` (status derived from
+    chain events), `/intents?initiator=`, `/stats` (fire-rate over a reproducible on-chain
+    denominator), `POST /record` (ASP registers compile-time metadata, auth'd). Pure core unit-tested
+    (11 tests); Legacy events indexed today, Design C signatures pre-registered. *(Reviewed, not
+    deployed — provision D1 + the real processor deploy blocks to go live; ASP fires best-effort
+    `/record` when `TELEMETRY_URL` is set.)*
 18. `[off]` **Compile-time sanity layer** ✅ (lints) — best-effort, never-blocks warnings folded
     into every compile: gasPrice gwei-vs-wei, waitTime-in-the-past, closed one-time timeRange,
     zero price target, implausibly-large amount (decimals slip). *(Swap autoQuote via QuoterV2 +

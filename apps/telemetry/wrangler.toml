@@ -1,0 +1,22 @@
+name = "w3cash-telemetry"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Cron: index new chain events every 2 minutes.
+[triggers]
+crons = ["*/2 * * * *"]
+
+# D1 database (create with: wrangler d1 create w3cash-telemetry, then paste the id here).
+[[d1_databases]]
+binding = "DB"
+database_name = "w3cash-telemetry"
+database_id = "REPLACE_WITH_D1_ID"
+
+# Per-deployment vars (set the real processor DEPLOY blocks so the indexer doesn't scan from 0):
+#   START_84532, START_1952, START_196  — the block each processor was deployed at.
+#   RPC_84532, RPC_1952, RPC_196        — optional RPC overrides.
+# Secret (wrangler secret put RECORD_SECRET) — the shared secret the ASP presents to POST /record.
+[vars]
+START_84532 = "0"
+START_1952 = "0"
+START_196 = "0"

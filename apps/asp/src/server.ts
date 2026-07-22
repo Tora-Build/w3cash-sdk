@@ -282,6 +282,28 @@ async function applyBridgeAutoQuote(body: CompileRequest): Promise<void> {
  * hash, and the raw 32-byte message the initiator must EIP-191 personal-sign.
  * This ASP NEVER signs or holds keys.
  */
+/**
+ * Best-effort telemetry registration (item 17): if TELEMETRY_URL is configured, POST the compiled
+ * intent's metadata to the telemetry worker so its status/dashboard can link the on-chain events
+ * (by payloadHash) back to this intent. Fire-and-forget — it never blocks the compile response and
+ * never throws; only public data (the hash + chain + initiator + a short summary) is sent.
+ */
+function recordToTelemetry(
+  intent: { payloadHash: string; chainId: number; humanSummary?: readonly string[] },
+  body: CompileRequest
+): void {
+  const url = process.env.TELEMETRY_URL;
+  if (!url) return;
+  const summary = (intent.humanSummary ?? []).slice(1, 3).join(" | ").slice(0, 200);
+  void fetch(`${url.replace(/\/$/, "")}/record`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-record-secret": process.env.TELEMETRY_SECRET ?? "" },
+    body: JSON.stringify({ payloadHash: intent.payloadHash, chainId: intent.chainId, initiator: body?.initiator, summary }),
+  }).catch(() => {
+    /* telemetry is a non-critical sidecar; a failed record must never affect compile */
+  });
+}
+
 const compileHandler: RequestHandler = async (req: Request, res: Response) => {
   try {
     const body = req.body as CompileRequest;
@@ -294,6 +316,7 @@ const compileHandler: RequestHandler = async (req: Request, res: Response) => {
     }
     const intent = compileIntent(body);
     res.status(200).json({ ok: true, intent });
+    recordToTelemetry(intent, body); // fire-and-forget; never blocks or throws
   } catch (err) {
     if (err instanceof AcrossQuoteError) {
       res.status(502).json({ ok: false, error: err.message, code: "BRIDGE_QUOTE" });
