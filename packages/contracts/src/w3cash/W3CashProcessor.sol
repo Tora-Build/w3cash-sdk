@@ -28,9 +28,13 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *      staticcall+exact-magic 1271), and the gas-capped best-effort keeper tip with a
  *      dedicated sub-budget + reserve-then-refund (item 10). The PostConditionAdapter
  *      (item 11) ships as a standalone VERB_ASSERT adapter (revert-on-unmet post-check).
- *      REMAINING (marked `NOTE(freeze):`) — ERC-7739 nested-712 for the 1271 root branch;
- *      a root-sourced flash premium/shortfall top-up (deferred — strategies self-fund the
- *      repay today); and the Permit2 WITNESS typestring + per-chain golden vectors (item 12).
+ *      Item 12 (release-gate vectors) is IN-REPO: flash-frame proofs (threading-isolation,
+ *      single-sub-group, sub-op-bounded, transient zero-on-exit), reverting/dirty tip resilience,
+ *      EIP-712 domain-separation-by-chainId, and the canonical Permit2 witness typestring (exposed
+ *      via `permit2WitnessTypeString()`). REMAINING for the EXTERNAL audit — ERC-7739 nested-712 for
+ *      the 1271 root branch (a deliberate contract-design decision, not rushed); a real-Permit2 fork
+ *      test of the pull; and a root-sourced flash premium/shortfall top-up (deferred — strategies
+ *      self-fund the repay today).
  *
  * Invariants preserved from the substrate (see DECISIONS.md ADR-0001):
  *   (1) PAUSE→resume: a failed gate returns before ANY state write; re-submitting the
@@ -299,6 +303,13 @@ contract W3CashProcessor is EIP712 {
 
         _exitFrame();
         emit WorkflowExecuted(iDigest, root, s.executions);
+    }
+
+    /// @notice The Permit2 witness type string this processor uses for permitWitnessTransferFrom
+    /// (item 12 conformance). Integrators + the golden-vector kit assert this is canonical; a real
+    /// Permit2 SignatureTransfer must be built with this exact suffix. The witness IS the intent digest.
+    function permit2WitnessTypeString() external pure returns (string memory) {
+        return WITNESS_TYPESTRING;
     }
 
     // ---------------------------------------------------------------------

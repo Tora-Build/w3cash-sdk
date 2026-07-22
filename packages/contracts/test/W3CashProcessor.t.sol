@@ -119,6 +119,27 @@ contract MockFlashAdapter {
     }
 }
 
+/// @dev Item-12 proof mock: forwards principal then calls onFlashLoan TWICE — the single-use flash
+/// slot must reject the second (FlashSlotConsumed).
+contract MockDoubleFlashAdapter {
+    function verb() external pure returns (uint32) { return 1 << 6; }
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function initiateFlash(address asset, uint256 amount, bytes calldata, bytes calldata cb) external {
+        MockERC20(asset).transfer(msg.sender, amount);
+        IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb);
+        IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb); // second => must revert
+    }
+}
+
+/// @dev Item-12 proof mock: a tip token whose transferFrom always reverts. The best-effort tip must
+/// swallow it (never brick the protective action).
+contract MockRevertingTipToken {
+    mapping(address => uint256) public balanceOf;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address, uint256) external pure returns (bool) { return true; }
+    function transferFrom(address, address, uint256) external pure returns (bool) { revert("hostile"); }
+}
+
 contract W3CashProcessorTest is Test {
     W3CashProcessor internal proc;
     MockPermit2 internal permit2;
@@ -695,5 +716,190 @@ contract W3CashProcessorTest is Test {
         proc.execute(g, rootSig, p, it, ops, sessSig);
         assertEq(erc.balanceOf(root), rootBefore);              // the prior action's pull was unwound
         assertEq(proc.executionsOf(proc.intentDigest(it)), 0);  // nothing committed
+    }
+
+    // ======================================================================
+    // Item 12 — release-gate security proofs + conformance vectors
+    // ======================================================================
+
+    /// Flash-frame proof 1: THREADED draws ONLY the per-frame ledger, never balanceOf. A balance
+    /// donated straight to the processor is NOT drawable — closes cross-intent balance confusion.
+    function test_Item12_Threading_CannotDrawDonatedBalance() public {
+        MockERC20 donated = new MockERC20();
+        donated.mint(address(proc), 1_000_000); // donate directly to the processor (not via a frame)
+        MockAction sink = new MockAction(1 << 1); // VERB_SWAP
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1);
+        p.allowedCodehashes[0] = address(sink).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](0);
+        p.verbMask = 1 << 1;
+        p.caps = new W3CashProcessor.TokenCap[](0);
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({ // THREADED draw of the donated token — frame ledger is empty
+            kind: W3CashProcessor.OpKind.ACTION, target: address(sink), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: address(donated), fundAmount: 1_000_000,
+            outToken: address(0), fundingParams: "", data: ""
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    /// Flash-frame proof: exactly ONE sub-group per frame — a second onFlashLoan reverts.
+    function test_Item12_Flash_DoubleSubGroup_Blocked() public {
+        MockDoubleFlashAdapter flash = new MockDoubleFlashAdapter();
+        MockSwapAction swap = new MockSwapAction(TOKEN, 1000);
+        erc.mint(address(flash), 2000);
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1);
+        p.allowedCodehashes[0] = address(swap).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](1);
+        p.flashCodehashes[0] = address(flash).codehash;
+        p.verbMask = (1 << 6) | (1 << 1);
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 100, resetPeriod: 0 });
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory subOps = new W3CashProcessor.Op[](1);
+        subOps[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(swap), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: TOKEN, fundAmount: 1000,
+            outToken: TOKEN, fundingParams: "", data: ""
+        });
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(flash), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "",
+            data: abi.encode(TOKEN, uint256(1000), bytes(""), abi.encode(subOps))
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        vm.expectRevert(W3CashProcessor.FlashSlotConsumed.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    /// Flash-frame proof: a sub-op cannot draw more than the borrowed principal (frame-bounded).
+    function test_Item12_Flash_SubOpCannotExceedPrincipal() public {
+        MockFlashAdapter flash = new MockFlashAdapter();
+        MockSwapAction swap = new MockSwapAction(TOKEN, 1); // output irrelevant; the draw reverts first
+        erc.mint(address(flash), 1000);
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1);
+        p.allowedCodehashes[0] = address(swap).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](1);
+        p.flashCodehashes[0] = address(flash).codehash;
+        p.verbMask = (1 << 6) | (1 << 1);
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 100, resetPeriod: 0 });
+
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory subOps = new W3CashProcessor.Op[](1);
+        subOps[0] = W3CashProcessor.Op({ // draw 2000 from a 1000 principal => InsufficientFrameBalance
+            kind: W3CashProcessor.OpKind.ACTION, target: address(swap), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: TOKEN, fundAmount: 2000,
+            outToken: TOKEN, fundingParams: "", data: ""
+        });
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(flash), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "",
+            data: abi.encode(TOKEN, uint256(1000), bytes(""), abi.encode(subOps))
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    /// A hostile tip token whose transferFrom reverts must NOT brick the protective action.
+    function test_Item12_Tip_RevertingToken_DoesNotBrick() public {
+        MockRevertingTipToken tip = new MockRevertingTipToken();
+        tip.mint(root, 1e21);
+        ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
+          W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
+            _tipBundle(address(tip), 50, address(0xBEEF));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        assertEq(proc.executionsOf(proc.intentDigest(it)), 1); // action ran; tip skipped
+    }
+
+    /// Conformance: EIP-712 domain binds to the EXECUTION chain — the SAME intent yields a DIFFERENT
+    /// digest on a different chainId (C2 cross-chain separation). This is what the per-chain golden
+    /// vectors assert.
+    function test_Item12_Conf_DomainSeparationByChainId() public {
+        ( , , , W3CashProcessor.Intent memory it, , ) = _bundle(true, 1000, 0, 600, 1, 0);
+        bytes32 d1 = proc.intentDigest(it);
+        vm.chainId(1952);
+        bytes32 d2 = proc.intentDigest(it);
+        assertTrue(d1 != d2, "digest must differ across chains");
+    }
+
+    /// Flash-frame proof 3 (transient zero-on-exit): after a flash intent completes, the frame
+    /// ledger is zeroed — a LATER intent in the SAME tx cannot draw a phantom leftover balance
+    /// (SIR.trading's $355k unzeroed-TSTORE class). Two top-level execute()s share one tx's
+    /// transient storage; the second's THREADED draw must fail because the frame was cleaned.
+    function test_Item12_Frame_ZeroedAfterFlash() public {
+        // --- intent 1: a working flash round-trip (credits then drains the frame) ---
+        MockFlashAdapter flash = new MockFlashAdapter();
+        MockSwapAction swap = new MockSwapAction(TOKEN, 1000);
+        erc.mint(address(flash), 1000);
+        W3CashProcessor.Policy memory p1;
+        p1.allowedCodehashes = new bytes32[](1); p1.allowedCodehashes[0] = address(swap).codehash;
+        p1.gateCodehashes = new bytes32[](0);
+        p1.flashCodehashes = new bytes32[](1); p1.flashCodehashes[0] = address(flash).codehash;
+        p1.verbMask = (1 << 6) | (1 << 1);
+        p1.caps = new W3CashProcessor.TokenCap[](1);
+        p1.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 100, resetPeriod: 0 });
+        W3CashProcessor.SessionGrant memory g1 = _grant(keccak256(abi.encode(p1)));
+        W3CashProcessor.Op[] memory sub = new W3CashProcessor.Op[](1);
+        sub[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(swap), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: TOKEN, fundAmount: 1000, outToken: TOKEN, fundingParams: "", data: "" });
+        W3CashProcessor.Op[] memory ops1 = new W3CashProcessor.Op[](1);
+        ops1[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(flash), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0, outToken: address(0),
+            fundingParams: "", data: abi.encode(TOKEN, uint256(1000), bytes(""), abi.encode(sub)) });
+        W3CashProcessor.Intent memory it1 = _intent(proc.grantDigest(g1), keccak256(abi.encode(ops1)), 1, 0);
+        proc.execute(g1, _sign(rootPk, proc.grantDigest(g1)), p1, it1, ops1, _sign(sessPk, proc.intentDigest(it1)));
+
+        // --- intent 2 (SAME tx): a THREADED draw of TOKEN must revert — frame was zeroed ---
+        MockAction sink = new MockAction(1 << 1);
+        W3CashProcessor.Policy memory p2;
+        p2.allowedCodehashes = new bytes32[](1); p2.allowedCodehashes[0] = address(sink).codehash;
+        p2.gateCodehashes = new bytes32[](0); p2.flashCodehashes = new bytes32[](0);
+        p2.verbMask = 1 << 1; p2.caps = new W3CashProcessor.TokenCap[](0);
+        W3CashProcessor.SessionGrant memory g2 = _grant(keccak256(abi.encode(p2)));
+        W3CashProcessor.Op[] memory ops2 = new W3CashProcessor.Op[](1);
+        ops2[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(sink), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: TOKEN, fundAmount: 500, outToken: address(0), fundingParams: "", data: "" });
+        W3CashProcessor.Intent memory it2 = _intent(proc.grantDigest(g2), keccak256(abi.encode(ops2)), 1, 0);
+        bytes memory rs2 = _sign(rootPk, proc.grantDigest(g2));
+        bytes memory ss2 = _sign(sessPk, proc.intentDigest(it2));
+        vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
+        proc.execute(g2, rs2, p2, it2, ops2, ss2);
+    }
+
+    /// Conformance: the Permit2 witness type string is canonical (item 12). A real Permit2
+    /// SignatureTransfer must be built with this exact suffix; the witness is the intent digest.
+    function test_Item12_Conf_Permit2WitnessTypestring() public view {
+        assertEq(
+            proc.permit2WitnessTypeString(),
+            "bytes32 witness)TokenPermissions(address token,uint256 amount)"
+        );
     }
 }

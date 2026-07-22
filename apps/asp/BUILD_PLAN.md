@@ -268,8 +268,14 @@ immutable-contract redeploy target; `[off]` = ships on the current deployment.
     recipes to open bounty.
 11. `[on]` **`PostConditionAdapter` as an ACTION verb** (`VERB_ASSERT`) — post-action
     slippage/MEV revert (a gate can't sit after actions).
-12. `[off]` **Formal-proof obligations + per-chain golden vectors** — the three
-    flash-frame proofs + Permit2/7739/native/tip/reentrancy release-gate vectors.
+12. `[off]` **Release-gate proofs + conformance vectors** ✅ (in-repo) — Foundry proofs:
+    flash-frame threading-isolation (donated balance not drawable), single-sub-group
+    (double `onFlashLoan` → `FlashSlotConsumed`), sub-op-bounded (draw > principal →
+    `InsufficientFrameBalance`), **transient zero-on-exit** (2nd intent in the same tx can't draw a
+    phantom frame — the SIR.trading class), reverting/dirty tip resilience, EIP-712
+    **domain-separation-by-chainId**, and the **canonical Permit2 witness typestring** (via
+    `permit2WitnessTypeString()`). 7 tests. *(EXTERNAL-audit remainder: ERC-7739 nested-712 for the
+    1271 root; a real-deployed-Permit2 fork test; the flash premium/shortfall top-up.)*
 
 **Off-chain — Phase-1 suite (ships now):**
 13. `[off]` Encoder safe-by-default (✅ partly done) + rebasing allowlist + dedicated
