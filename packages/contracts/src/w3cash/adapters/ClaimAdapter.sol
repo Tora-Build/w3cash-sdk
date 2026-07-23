@@ -66,11 +66,15 @@ contract ClaimAdapter is IAdapter {
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Deployer/admin authorized to set the rewards controller (audit #6).
+    address public immutable owner;
+
     /// @param _processor The authorized Processor address
     /// @param _aaveRewardsController The Aave rewards controller (can be zero)
     constructor(address _processor, address _aaveRewardsController) {
         processor = _processor;
         aaveRewardsController = _aaveRewardsController;
+        owner = msg.sender;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -135,7 +139,7 @@ contract ClaimAdapter is IAdapter {
 
     /// @notice Update Aave rewards controller
     function setAaveRewardsController(address _controller) external {
-        // In production, add access control
+        require(msg.sender == owner, "not owner"); // audit #6: was permissionless global-state DoS
         aaveRewardsController = _controller;
     }
 

@@ -100,10 +100,11 @@ app.get("/payment-options", (_req: Request, res: Response) => {
 
 // AgentCard — the machine-readable discovery descriptor (item 19). Served at both the
 // friendly path and the well-known convention agent frameworks probe.
-const agentCardHandler: RequestHandler = (req: Request, res: Response) => {
-  const proto = (req.headers["x-forwarded-proto"] as string) ?? "https";
-  const host = req.headers.host ?? "asp.w3.cash";
-  res.status(200).json(getAgentCard(`${proto}://${host}`, paymentConfig));
+const agentCardHandler: RequestHandler = (_req: Request, res: Response) => {
+  // Use a CONFIGURED origin, never the attacker-controllable Host/X-Forwarded-Proto headers
+  // (audit info-finding) — otherwise the advertised endpoint URLs could be spoofed.
+  const base = process.env.PUBLIC_BASE_URL ?? "https://asp.w3.cash";
+  res.status(200).json(getAgentCard(base, paymentConfig));
 };
 app.get("/agent-card", agentCardHandler);
 app.get("/.well-known/agent-card.json", agentCardHandler);

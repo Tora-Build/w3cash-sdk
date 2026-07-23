@@ -78,12 +78,16 @@ contract AaveAdapter is IAdapter {
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Deployer/admin authorized to register aTokens (audit #6).
+    address public immutable owner;
+
     /// @notice Initialize the adapter with the Aave V3 Pool and Processor
     /// @param _pool The Aave V3 Pool address
     /// @param _processor The authorized Processor address
     constructor(address _pool, address _processor) {
         pool = IAavePool(_pool);
         processor = _processor;
+        owner = msg.sender;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -94,7 +98,9 @@ contract AaveAdapter is IAdapter {
     /// @param underlying The underlying token address
     /// @param aToken The corresponding aToken address
     function registerAToken(address underlying, address aToken) external {
-        // In production, this should be access controlled
+        // Owner-gated (audit #6): a permissionless setter lets anyone misroute Aave withdrawals by
+        // overwriting an underlying's aToken mapping.
+        require(msg.sender == owner, "not owner");
         aTokens[underlying] = aToken;
     }
 
