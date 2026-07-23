@@ -29,7 +29,10 @@ const EVENT_DEFS: readonly EventDef[] = [
   // Legacy (deployed): payloadHash is the 2nd non-indexed data word.
   { sig: "LocalCommandProcessed(uint256,bytes32)", kind: "executed", hashFrom: { kind: "data", word: 1 } },
   { sig: "WorkflowPaused(uint256,bytes32)", kind: "paused", hashFrom: { kind: "data", word: 1 } },
-  { sig: "NonceCancelled(address,uint256,uint256)", kind: "cancelled", hashFrom: { kind: "topic", index: 1 } },
+  // NOTE (round-3 audit): Legacy `NonceCancelled(user, old, new)` carries NO payloadHash — it's
+  // per-user nonce-scoped, so it can't be linked to an intent by hash. It was previously mis-keyed on
+  // the user address (which never matches an intent). Legacy cancellation is left UNTRACKED here;
+  // linking it would require nonce-based attribution (deferred). Design C emits per-intent events.
   // Design C (future): intentDigest is indexed topic1.
   { sig: "WorkflowExecuted(bytes32,address,uint32)", kind: "executed", hashFrom: { kind: "topic", index: 1 } },
   { sig: "WorkflowPaused(bytes32,uint256)", kind: "paused", hashFrom: { kind: "topic", index: 1 } },

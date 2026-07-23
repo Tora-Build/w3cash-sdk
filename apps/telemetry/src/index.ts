@@ -45,6 +45,16 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
 }
 
+/** Length-independent, short-circuit-free string comparison (round-3 audit). */
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i]! ^ (bb[i] ?? 0);
+  return diff === 0;
+}
+
 export default {
   async scheduled(_event: unknown, env: Env): Promise<void> {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -89,7 +99,10 @@ export default {
 
     // POST /record — the ASP registers a compiled intent's metadata (auth via shared secret).
     if (p === "/record" && req.method === "POST") {
-      if (!env.RECORD_SECRET || req.headers.get("x-record-secret") !== env.RECORD_SECRET) return json({ ok: false, error: "unauthorized" }, 401);
+      // Constant-time compare (round-3 audit): a `!==` string compare short-circuits and leaks the
+      // secret length/prefix via timing.
+      if (!env.RECORD_SECRET || !timingSafeEqual(req.headers.get("x-record-secret") ?? "", env.RECORD_SECRET))
+        return json({ ok: false, error: "unauthorized" }, 401);
       const b = (await req.json().catch(() => null)) as { payloadHash?: string; chainId?: number; initiator?: string; summary?: string } | null;
       const hash = b?.payloadHash ?? "";
       if (!/^0x[0-9a-fA-F]{64}$/.test(hash) || typeof b?.chainId !== "number") return json({ ok: false, error: "payloadHash + chainId required" }, 400);
