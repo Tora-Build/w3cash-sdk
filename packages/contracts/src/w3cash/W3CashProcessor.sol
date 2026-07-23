@@ -203,6 +203,7 @@ contract W3CashProcessor is EIP712 {
     bytes32 private constant _T_FRAME_BASE = keccak256("w3cash.v2.frameReceived");
     uint256 private constant _T_FLASH_ADAPTER = uint256(keccak256("w3cash.v2.flashAdapter")); // pinned callback caller (F1)
     uint256 private constant _T_FLASH_CTX = uint256(keccak256("w3cash.v2.flashCtx"));         // keccak(root,subOps) bind (F1)
+    uint256 private constant _T_FLASH_PREBAL = uint256(keccak256("w3cash.v2.flashPrebal"));   // asset balance snapshot before the flash (audit F1)
 
     // ---------------------------------------------------------------------
     // Events
@@ -301,6 +302,10 @@ contract W3CashProcessor is EIP712 {
         if (callerNative > 0) _sweepNative(msg.sender, callerNative);
         uint256 frameNative = _frameGet(NATIVE);
         if (frameNative > 0) { _frameSet(NATIVE, 0); _sweepNative(root, frameNative); }
+        // Symmetric ERC20 sweep (audit F2): any measured frame output a THREADED op under-drew is
+        // root's — return it, so nothing strands in this immutable contract (and no resident ERC20
+        // pool remains to be harvested). Runs before _exitFrame zeroes the ledger.
+        _sweepFrameTokens(root);
 
         _exitFrame();
         emit WorkflowExecuted(iDigest, root, s.executions);
@@ -341,7 +346,9 @@ contract W3CashProcessor is EIP712 {
     /// @notice Per-intent selective cancel (sub-session granularity). Authorized by the session's
     /// root OR its session key; the grant binds the intent (it.session == gDigest) (item 9).
     function cancelIntent(SessionGrant calldata g, Intent calldata it) external {
-        if (msg.sender != g.root && msg.sender != g.sessionKey) revert NotAuthorized();
+        // ROOT only (audit F8): cancel is a one-way latch, so a leaked SESSION KEY must not be able
+        // to permanently kill a protective intent. The session key rotates via root's revokeSession.
+        if (msg.sender != g.root) revert NotAuthorized();
         if (it.session != _grantDigest(g)) revert WrongSession();
         bytes32 iDigest = _intentDigest(it);
         intentState[iDigest].cancelled = true;
@@ -438,6 +445,10 @@ contract W3CashProcessor is EIP712 {
                         if (op.fundToken == address(0) || op.fundToken == NATIVE) revert PolicyDenied(); // audit I2
                         if (op.funding == FundingMode.PERMIT2 && maxRuns != 1) revert PermitRecurring();  // one-shot only (item 9)
                         if (_capIndex(p, op.fundToken) == NONE) revert TokenNotCapped();
+                    } else if (op.funding == FundingMode.THREADED) {
+                        // Native is never frame-threadable (op.value is the native path); a THREADED
+                        // native op would zero the native ledger without forwarding → stranded ETH (audit F5).
+                        if (op.fundToken == address(0) || op.fundToken == NATIVE) revert PolicyDenied();
                     } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
                         revert PolicyDenied();
                     }
@@ -578,6 +589,10 @@ contract W3CashProcessor is EIP712 {
     /// call the ADAPTER (which owns all pool ABI — F2). Sub-ops are THREADED-only, so the re-entrant
     /// callback needs no policy/cap access.
     function _runFlashOp(Policy calldata policy, Op calldata op, address root) internal {
+        // Re-assert the flash gate at DISPATCH on the authoritative allowlist (audit F7): a
+        // mutable-verb adapter could read a non-flash verb at shape-check time and VERB_FLASH here.
+        if (!_codehashIn(policy.flashCodehashes, op.target)) revert PolicyDenied();
+        if (op.funding != FundingMode.NONE || op.value != 0) revert PolicyDenied();
         (address asset, uint256 amount, bytes memory poolParams, bytes memory subOpsBytes) =
             abi.decode(op.data, (address, uint256, bytes, bytes));
         Op[] memory subOps = abi.decode(subOpsBytes, (Op[]));
@@ -586,9 +601,13 @@ contract W3CashProcessor is EIP712 {
         bytes memory cb = abi.encode(root, asset, amount, subOpsBytes);
         _tstore(_T_FLASH_ADAPTER, uint256(uint160(op.target))); // F1: pin the exact callback caller
         _tstore(_T_FLASH_CTX, uint256(keccak256(cb)));          // F1: bind the sub-group
+        // Snapshot the asset balance so onFlashLoan credits the MEASURED principal, not a claimed
+        // `amount` (audit F1 — a phantom callback would otherwise mint frame credit + drain residue).
+        _tstore(_T_FLASH_PREBAL, IERC20(asset).balanceOf(address(this)));
         IFlashAdapter(op.target).initiateFlash(asset, amount, poolParams, cb);
         _tstore(_T_FLASH_ADAPTER, 0);
         _tstore(_T_FLASH_CTX, 0);
+        _tstore(_T_FLASH_PREBAL, 0);
     }
 
     /// @dev Validate a flash sub-group at dispatch (policy in scope). Actions only, THREADED-only
@@ -626,7 +645,11 @@ contract W3CashProcessor is EIP712 {
             abi.decode(cb, (address, address, uint256, bytes));
         if (cbAsset != asset || cbAmount != amount) revert SubGroupMismatch();
 
-        _frameCredit(asset, amount); // the borrowed principal now lives in the frame
+        // Credit the MEASURED principal (balance delta since dispatch), NOT the caller-claimed
+        // `amount` (audit F1). A phantom callback that forwards nothing credits 0, so the repay of
+        // amount+premium can't be covered by the frame → RepayShortfall; resident balances are safe.
+        uint256 received = IERC20(asset).balanceOf(address(this)) - _tload(_T_FLASH_PREBAL);
+        _frameCredit(asset, received);
 
         Op[] memory subOps = abi.decode(subOpsBytes, (Op[]));
         for (uint256 i = 0; i < subOps.length; ++i) {
@@ -719,6 +742,9 @@ contract W3CashProcessor is EIP712 {
 
     function _assertCaps(Policy calldata p) internal pure {
         for (uint256 i = 0; i < p.caps.length; ++i) {
+            // A native/sentinel-keyed cap enforces nothing (native is caller/frame-supplied, never a
+            // metered root pull) — reject it so a policy author isn't lulled into false safety (audit F9).
+            if (p.caps[i].token == address(0) || p.caps[i].token == NATIVE) revert PolicyDenied();
             // MIN_RESET floor: a rolling window can't be set to per-block (item 9).
             uint40 rp = p.caps[i].resetPeriod;
             if (rp != 0 && rp < MIN_RESET) revert ResetTooShort();
@@ -767,7 +793,20 @@ contract W3CashProcessor is EIP712 {
         _tstore(_T_FLASH, 0);
         _tstore(_T_FLASH_ADAPTER, 0);
         _tstore(_T_FLASH_CTX, 0);
+        _tstore(_T_FLASH_PREBAL, 0);
         _tstore(_T_DEPTH, 0);
+    }
+
+    /// @dev Return every touched non-native frame-ledger ERC20 balance to `root` (audit F2). Zeroes
+    /// the ledger slot as it goes so _exitFrame's later zero-pass is a no-op for these.
+    function _sweepFrameTokens(address root) internal {
+        uint256 n = _tload(_T_TOUCH_LEN);
+        for (uint256 i = 0; i < n; ++i) {
+            address tok = address(uint160(_tload(uint256(keccak256(abi.encode(_T_TOUCH_BASE, i))))));
+            if (tok == address(0) || tok == NATIVE) continue; // native handled separately above
+            uint256 bal = _frameGet(tok);
+            if (bal > 0) { _frameSet(tok, 0); IERC20(tok).safeTransfer(root, bal); }
+        }
     }
 
     function _depth() internal view returns (uint256) { return _tload(_T_DEPTH); }

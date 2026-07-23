@@ -152,6 +152,16 @@ contract MockBadAccount {
     }
 }
 
+/// @dev Blind-audit F1 mock: a "flash adapter" that forwards NOTHING but claims a loan — the
+/// measured-principal fix must credit 0 and revert RepayShortfall (no drain of resident balances).
+contract MockPhantomFlashAdapter {
+    function verb() external pure returns (uint32) { return 1 << 6; } // VERB_FLASH
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function initiateFlash(address asset, uint256 amount, bytes calldata, bytes calldata cb) external {
+        IProcessorFlash(msg.sender).onFlashLoan(asset, amount, 0, cb); // forwards nothing
+    }
+}
+
 /// @dev Item-12 proof mock: a tip token whose transferFrom always reverts. The best-effort tip must
 /// swallow it (never brick the protective action).
 contract MockRevertingTipToken {
@@ -975,6 +985,96 @@ contract W3CashProcessorTest is Test {
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
         vm.expectRevert(W3CashProcessor.BadRootSig.selector);
         proc.execute(g, "0x", p, it, ops, sessSig);
+    }
+
+    // ======================================================================
+    // Blind-audit fixes — regression tests
+    // ======================================================================
+
+    /// F1 (HIGH): a phantom flash callback (forwards nothing, claims `amount`) must NOT drain the
+    /// processor's resident ERC20 — the measured-principal fix credits 0 → RepayShortfall.
+    function test_AuditF1_PhantomFlash_CannotDrainResident() public {
+        MockPhantomFlashAdapter flash = new MockPhantomFlashAdapter();
+        erc.mint(address(proc), 5000); // resident balance the attacker wants to steal
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1); p.allowedCodehashes[0] = address(action).codehash;
+        p.gateCodehashes = new bytes32[](0);
+        p.flashCodehashes = new bytes32[](1); p.flashCodehashes[0] = address(flash).codehash;
+        p.verbMask = 1 << 6; // VERB_FLASH
+        p.caps = new W3CashProcessor.TokenCap[](0);
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({
+            kind: W3CashProcessor.OpKind.ACTION, target: address(flash), value: 0,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0,
+            outToken: address(0), fundingParams: "",
+            data: abi.encode(TOKEN, uint256(5000), bytes(""), abi.encode(new W3CashProcessor.Op[](0)))
+        });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        vm.expectRevert(W3CashProcessor.RepayShortfall.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+        assertEq(erc.balanceOf(address(proc)), 5000); // resident balance untouched
+    }
+
+    /// F2 (LOW): ERC20 frame residue a THREADED op under-draws is swept to root (not stranded, and
+    /// no resident pool remains to be harvested).
+    function test_AuditF2_Erc20FrameResidue_SweptToRoot() public {
+        MockERC20 erc2 = new MockERC20();
+        MockSwapAction swap = new MockSwapAction(address(erc2), 1000); // outputs 1000 erc2
+        erc2.mint(address(swap), 1000);
+        MockAction sink = new MockAction(1 << 1);
+
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](2);
+        p.allowedCodehashes[0] = address(swap).codehash; p.allowedCodehashes[1] = address(sink).codehash;
+        p.gateCodehashes = new bytes32[](0); p.flashCodehashes = new bytes32[](0);
+        p.verbMask = 1 << 1;
+        p.caps = new W3CashProcessor.TokenCap[](1);
+        p.caps[0] = W3CashProcessor.TokenCap({ token: TOKEN, cap: 1000, resetPeriod: 0 });
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](2);
+        ops[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(swap), value: 0,
+            funding: W3CashProcessor.FundingMode.STANDING, fundToken: TOKEN, fundAmount: 600, outToken: address(erc2), fundingParams: "", data: "" });
+        ops[1] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(sink), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: address(erc2), fundAmount: 600, outToken: address(0), fundingParams: "", data: "" }); // draws only 600 of 1000
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        assertEq(erc2.balanceOf(root), 400);            // 1000 output - 600 drawn = 400 swept to root
+        assertEq(erc2.balanceOf(address(proc)), 0);     // nothing stranded
+    }
+
+    /// F5 (LOW): a THREADED op that names native as its fundToken is rejected at the shape check
+    /// (would otherwise zero the native ledger without forwarding → stranded ETH).
+    function test_AuditF5_ThreadedNativeFundToken_Rejected() public {
+        MockAction sink = new MockAction(1 << 1);
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1); p.allowedCodehashes[0] = address(sink).codehash;
+        p.gateCodehashes = new bytes32[](0); p.flashCodehashes = new bytes32[](0);
+        p.verbMask = 1 << 1; p.caps = new W3CashProcessor.TokenCap[](0);
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(sink), value: 0,
+            funding: W3CashProcessor.FundingMode.THREADED, fundToken: NATIVE, fundAmount: 1, outToken: address(0), fundingParams: "", data: "" });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+        vm.expectRevert(W3CashProcessor.PolicyDenied.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig);
+    }
+
+    /// F8: a leaked session key can NO LONGER permanently cancel a protective intent (root-only).
+    function test_AuditF8_SessionKeyCannotCancel() public {
+        ( W3CashProcessor.SessionGrant memory g, , , W3CashProcessor.Intent memory it, , ) =
+            _bundle(true, 1000, 0, 600, 1, 0);
+        vm.prank(sessionKey);
+        vm.expectRevert(W3CashProcessor.NotAuthorized.selector);
+        proc.cancelIntent(g, it);
     }
 
     /// The ERC-7739 support surface is exposed (domain via ERC-5267 + contents types).
