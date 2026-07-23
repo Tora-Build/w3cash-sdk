@@ -287,7 +287,13 @@ contract W3CashProcessor is EIP712 {
         uint256 permitIdx;
         for (uint256 i = boundary; i < ops.length; ++i) {
             Op calldata op = ops[i];
-            if (op.value != 0) callerNative = _drawNative(op.value, callerNative);
+            // How much of op.value comes from the caller's msg.value (drawn first) vs the frame —
+            // used to refund a caller-fronted native refund to the KEEPER, not root (audit F3/#13).
+            uint256 fromCaller;
+            if (op.value != 0) {
+                fromCaller = op.value <= callerNative ? op.value : callerNative;
+                callerNative = _drawNative(op.value, callerNative);
+            }
             if (_adapterVerb(op.target) & VERB_FLASH != 0) {
                 _runFlashOp(policy, op, root); // controlled-callback flash sub-group (item 7)
             } else {
@@ -296,7 +302,7 @@ contract W3CashProcessor is EIP712 {
                 if (op.funding == FundingMode.PERMIT2) { permitSig = fundingSigs[permitIdx]; unchecked { ++permitIdx; } }
                 // Reserve (root-sourced) or draw (threaded) the input; returns the amount to push.
                 uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest, permitSig);
-                _feedAndRun(op, root, fed);
+                _feedAndRun(op, root, fed, fromCaller);
             }
         }
 
@@ -457,9 +463,9 @@ contract W3CashProcessor is EIP712 {
                     } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
                         revert PolicyDenied();
                     }
-                    // A post-condition (assert) adapter moves no funds; forwarding native to it would
-                    // strand (it never spends/refunds op.value) (audit F4 belt-and-suspenders).
-                    if (v & VERB_ASSERT != 0 && op.value != 0) revert PolicyDenied();
+                    // A post-condition (assert) adapter moves no funds; any funding/native pushed to
+                    // it would strand (it never spends/refunds) — force NONE + no value (audit #14).
+                    if (v & VERB_ASSERT != 0 && (op.funding != FundingMode.NONE || op.value != 0)) revert PolicyDenied();
                 }
                 // Native op.value is caller/frame-supplied (never a root pull) => NOT cap-metered (item 8).
             }
@@ -545,7 +551,7 @@ contract W3CashProcessor is EIP712 {
     /// @dev Push the fed input to the codehash-pinned adapter, run it, and credit the MEASURED output
     /// delta to the frame ledger for downstream THREADED ops. SOLE-MOVER: the adapter is a pure
     /// function of pushed tokens + value + data and cannot reach root funds.
-    function _feedAndRun(Op memory op, address root, uint256 fed) internal {
+    function _feedAndRun(Op memory op, address root, uint256 fed, uint256 fromCaller) internal {
         if (op.fundToken != address(0) && op.fundToken != NATIVE && fed > 0) {
             IERC20(op.fundToken).safeTransfer(op.target, fed);
         }
@@ -560,7 +566,14 @@ contract W3CashProcessor is EIP712 {
 
         // received native = balAfter + op.value(sent out during the call) - balBefore
         uint256 nativeAfter = address(this).balance + op.value;
-        if (nativeAfter > nativeBefore) _frameCredit(NATIVE, nativeAfter - nativeBefore);
+        if (nativeAfter > nativeBefore) {
+            uint256 recv = nativeAfter - nativeBefore;
+            // Refund the caller-fronted portion of a native refund to the KEEPER (msg.sender), not
+            // root (audit #13); credit only the remainder (frame/unwrap-sourced, root's) to the frame.
+            uint256 toCaller = recv <= fromCaller ? recv : fromCaller;
+            if (toCaller > 0) _sweepNative(msg.sender, toCaller);
+            if (recv > toCaller) _frameCredit(NATIVE, recv - toCaller);
+        }
         if (op.outToken != address(0) && op.outToken != NATIVE) {
             uint256 ercAfter = IERC20(op.outToken).balanceOf(address(this));
             if (ercAfter > ercBefore) _frameCredit(op.outToken, ercAfter - ercBefore);
@@ -662,7 +675,7 @@ contract W3CashProcessor is EIP712 {
         for (uint256 i = 0; i < subOps.length; ++i) {
             Op memory s = subOps[i];
             uint256 fed = _drawThreaded(s);       // reserve-before-pull is N/A: frame-sourced, cap-exempt
-            _feedAndRun(s, root, fed);
+            _feedAndRun(s, root, fed, 0);         // sub-ops carry no native (value==0 enforced)
         }
 
         // Repay principal + premium to the adapter, FULLY from the frame (self-funding strategy).

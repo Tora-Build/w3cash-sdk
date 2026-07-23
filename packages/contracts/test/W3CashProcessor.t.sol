@@ -83,6 +83,17 @@ contract MockUnwrapAction is IActionAdapter {
     receive() external payable {}
 }
 
+/// @dev Native-refunder: forwarded op.value, returns ALL of it to the processor (models an
+/// exact-output adapter that over-received native). Audit #13: the refund must reach the keeper.
+contract MockNativeRefunder is IActionAdapter {
+    function adapterKind() external pure returns (uint8) { return 2; }
+    function verb() external pure returns (uint32) { return 1 << 0; } // VERB_TRANSFER
+    function run(address, bytes calldata) external payable returns (bytes memory) {
+        (bool ok, ) = msg.sender.call{ value: msg.value }(""); require(ok, "refund");
+        return "";
+    }
+}
+
 /// @dev Native-sink action: forwarded op.value; records what it received.
 contract MockNativeSink is IActionAdapter {
     uint256 public received;
@@ -1079,6 +1090,51 @@ contract W3CashProcessorTest is Test {
         vm.prank(sessionKey);
         vm.expectRevert(W3CashProcessor.NotAuthorized.selector);
         proc.cancelIntent(g, it);
+    }
+
+    /// #13: a keeper-fronted native refund goes back to the KEEPER (msg.sender), not root.
+    function test_AuditN13_CallerNativeRefund_GoesToKeeper() public {
+        MockNativeRefunder refunder = new MockNativeRefunder();
+        W3CashProcessor.Policy memory p;
+        p.allowedCodehashes = new bytes32[](1); p.allowedCodehashes[0] = address(refunder).codehash;
+        p.gateCodehashes = new bytes32[](0); p.flashCodehashes = new bytes32[](0);
+        p.verbMask = 1 << 0; p.caps = new W3CashProcessor.TokenCap[](0);
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(refunder), value: 1 ether,
+            funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0, outToken: address(0), fundingParams: "", data: "" });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+
+        address keeper = address(0xBEEF);
+        vm.deal(keeper, 1 ether);
+        uint256 rootBefore = root.balance;
+        vm.prank(keeper);
+        proc.execute{ value: 1 ether }(g, rootSig, p, it, ops, sessSig, NO_SIGS);
+        assertEq(keeper.balance, 1 ether);       // refund returned to the keeper who fronted it
+        assertEq(root.balance, rootBefore);      // root gained nothing
+        assertEq(address(proc).balance, 0);
+    }
+
+    /// #14: a VERB_ASSERT op with non-NONE funding is rejected (funds would strand at the adapter).
+    function test_AuditN14_FundedAssertOp_Rejected() public {
+        PostConditionAdapter pc = new PostConditionAdapter();
+        W3CashProcessor.Policy memory p = _policy(1000, 0);
+        // add the post-condition adapter to the allowlist + VERB_ASSERT to the mask
+        p.allowedCodehashes = new bytes32[](2);
+        p.allowedCodehashes[0] = address(action).codehash; p.allowedCodehashes[1] = address(pc).codehash;
+        p.verbMask = proc.VERB_TRANSFER() | proc.VERB_ASSERT();
+        W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
+        W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](1);
+        ops[0] = W3CashProcessor.Op({ kind: W3CashProcessor.OpKind.ACTION, target: address(pc), value: 0,
+            funding: W3CashProcessor.FundingMode.STANDING, fundToken: TOKEN, fundAmount: 100, // funded assert => reject
+            outToken: address(0), fundingParams: "", data: abi.encode(TOKEN, bytes(""), uint8(3), uint256(0)) });
+        W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
+        bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
+        vm.expectRevert(W3CashProcessor.PolicyDenied.selector);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     /// The ERC-7739 support surface is exposed (domain via ERC-5267 + contents types).
