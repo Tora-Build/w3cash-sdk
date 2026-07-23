@@ -27,11 +27,20 @@ function policy() {
   const maxAmount = BigInt(process.env.X402_MAX_AMOUNT ?? "1000000"); // 1.0 (6-dp) per call
   const networks = (process.env.X402_ALLOWED_NETWORKS ?? "eip155:196,eip155:1952")
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  // Default the payTo allowlist to the known ASP receiver (round-3 audit: an empty list accepted any
-  // recipient up to the cap). Operators override with X402_ALLOWED_PAYTO.
-  const payTo = (process.env.X402_ALLOWED_PAYTO ?? "0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3")
+  // Default the payTo allowlist to the known ASP receiver. `?? default` only fires on unset, so an
+  // explicitly-empty value (`X402_ALLOWED_PAYTO=`) must also be normalized back to the default —
+  // otherwise it yields [] and the recipient gate would fail OPEN (round-4 audit). Trim first so a
+  // whitespace-only value is treated as empty.
+  const payToRaw = (process.env.X402_ALLOWED_PAYTO ?? "").trim();
+  const payTo = (payToRaw === "" ? "0xe403ba51f5132cf8d95fc4e37356bf0f894a4ab3" : payToRaw)
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  return { host, maxAmount, networks, payTo };
+  // Optional asset allowlist (CAIP-agnostic contract addresses). Empty = accept any asset the
+  // challenge names; set X402_ALLOWED_ASSETS to pin the settlement token so the value cap can't be
+  // dodged with a higher-value/low-decimal token (round-4 audit). Combined with payTo above, a
+  // compromised (non-operator) server still can't redirect funds.
+  const assets = (process.env.X402_ALLOWED_ASSETS ?? "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return { host, maxAmount, networks, payTo, assets };
 }
 
 function acceptable(r: Requirement, p: ReturnType<typeof policy>): boolean {
@@ -39,7 +48,12 @@ function acceptable(r: Requirement, p: ReturnType<typeof policy>): boolean {
   let amt: bigint;
   try { amt = BigInt(r.amount ?? "0"); } catch { return false; }
   if (amt > p.maxAmount) return false;
-  if (p.payTo.length > 0 && !p.payTo.includes((r.payTo ?? "").toLowerCase())) return false;
+  // payTo fails CLOSED: an empty allowlist rejects every recipient, matching the network check
+  // above (round-4 audit). policy() defaults payTo to the known receiver, so this only bites a
+  // deliberately-malformed override.
+  if (!p.payTo.includes((r.payTo ?? "").toLowerCase())) return false;
+  // Asset allowlist is opt-in: only enforced when configured.
+  if (p.assets.length > 0 && !p.assets.includes((r.asset ?? "").toLowerCase())) return false;
   return true;
 }
 

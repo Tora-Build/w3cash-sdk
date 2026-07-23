@@ -135,12 +135,27 @@ function paidNetworkFromRequest(req: Request): string | null {
   }
 }
 
-/** Best-effort disclosure: echo the settled network on the response. Never throws. */
-const disclosureMiddleware: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
-  const net = paidNetworkFromRequest(req);
-  if (net) res.setHeader("X-Payment-Network", net);
-  next();
-};
+/**
+ * Best-effort disclosure: echo the settled network on the response. Never throws.
+ *
+ * Scoped to the PAID route only, and only echoes a network that (a) is one we actually settle on
+ * and (b) the payment gate already verified for this request. Previously this fired on EVERY route
+ * (it was mounted globally) and echoed the raw, unvalidated caller-supplied `x-payment` network —
+ * so any client could stamp `X-Payment-Network: <anything>` on a free response like /health,
+ * falsely certifying a settlement that never happened (round-4 audit).
+ */
+function makeDisclosureMiddleware(cfg: PaymentConfig): RequestHandler {
+  const allowed = new Set(resolvePaymentNetworks(cfg).map((n) => n.toLowerCase()));
+  return (req: Request, res: Response, next: NextFunction) => {
+    // req.path is "/compile-intent" only after the payment gate let this request through (it 402s
+    // unpaid). On any other (free) route we never attach the header.
+    if (req.path === "/compile-intent") {
+      const net = paidNetworkFromRequest(req);
+      if (net && allowed.has(net.toLowerCase())) res.setHeader("X-Payment-Network", net);
+    }
+    next();
+  };
+}
 
 /** Build the x402 middleware, or null when payments are disabled/misconfigured. */
 export async function buildX402Middleware(
@@ -207,12 +222,13 @@ export async function buildX402Middleware(
       resourceServer
     );
 
-    // Chain the disclosure wrapper AFTER the payment gate so a settled request echoes
-    // X-Payment-Network. Both are no-ops on non-/compile-intent routes.
+    // Chain the disclosure wrapper AFTER the payment gate so a settled /compile-intent request
+    // echoes X-Payment-Network. Both are no-ops on non-/compile-intent routes.
+    const disclosure = makeDisclosureMiddleware(cfg);
     const composed: RequestHandler = (req, res, next) => {
       paymentGate(req, res, (err?: unknown) => {
         if (err) return next(err as Error);
-        disclosureMiddleware(req, res, next);
+        disclosure(req, res, next);
       });
     };
     return composed;

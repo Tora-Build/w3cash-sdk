@@ -183,9 +183,10 @@ app.post("/quote/bridge", async (req: Request, res: Response) => {
     if (
       !b ||
       typeof b !== "object" ||
-      !b.inputToken ||
+      typeof b.inputToken !== "string" ||
+      (b.outputToken !== undefined && typeof b.outputToken !== "string") ||
       b.destinationChainId === undefined ||
-      !b.inputAmount
+      typeof b.inputAmount !== "string"
     ) {
       res.status(400).json({
         ok: false,
@@ -256,9 +257,16 @@ async function applyBridgeAutoQuote(body: CompileRequest): Promise<void> {
     );
   }
   for (const a of autoQuoteActions) {
-    if (!a.inputToken || a.destinationChainId === undefined || !a.inputAmount) {
+    // Require STRING token/amount fields (a non-string would throw a raw TypeError inside
+    // fetchAcrossQuote's .toLowerCase() before its try, surfacing as 500 not 400) (round-6 audit).
+    if (
+      typeof a.inputToken !== "string" ||
+      (a.outputToken !== undefined && typeof a.outputToken !== "string") ||
+      a.destinationChainId === undefined ||
+      typeof a.inputAmount !== "string"
+    ) {
       throw new ValidationError(
-        "bridge autoQuote requires inputToken, destinationChainId and inputAmount"
+        "bridge autoQuote requires string inputToken, destinationChainId and inputAmount"
       );
     }
     const quote = await fetchAcrossQuote({

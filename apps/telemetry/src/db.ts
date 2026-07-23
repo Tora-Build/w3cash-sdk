@@ -35,10 +35,24 @@ export async function upsertEvents(db: D1Like, rows: EventRow[], nowSec: number)
   }
 }
 
-export async function eventsForHash(db: D1Like, payloadHash: string): Promise<EventRow[]> {
-  const { results } = await db.prepare(
-    "SELECT chain_id AS chainId, tx_hash AS txHash, log_index AS logIndex, block, event, kind, payload_hash AS payloadHash FROM events WHERE payload_hash = ? ORDER BY block, log_index"
-  ).bind(payloadHash.toLowerCase()).all<EventRow>();
+/**
+ * Events for a payloadHash. MUST be scoped by chainId wherever the caller has one: the deployed
+ * Legacy processor hashes `keccak256(payload)` with no chainId in the preimage, and the same
+ * processor address is indexed on X Layer testnet(1952) AND mainnet(196), so an identical intent
+ * yields the same payloadHash on both chains. Without the chain predicate a testnet row would
+ * contaminate the mainnet intent's reported status (round-4 audit). When chainId is omitted the
+ * caller MUST group the rows per chain before deriving a status (see index.ts /intent/:hash).
+ */
+export async function eventsForHash(db: D1Like, payloadHash: string, chainId?: number): Promise<EventRow[]> {
+  const cols =
+    "SELECT chain_id AS chainId, tx_hash AS txHash, log_index AS logIndex, block, event, kind, payload_hash AS payloadHash FROM events WHERE payload_hash = ?";
+  if (chainId === undefined) {
+    const { results } = await db.prepare(`${cols} ORDER BY chain_id, block, log_index`)
+      .bind(payloadHash.toLowerCase()).all<EventRow>();
+    return results;
+  }
+  const { results } = await db.prepare(`${cols} AND chain_id = ? ORDER BY block, log_index`)
+    .bind(payloadHash.toLowerCase(), chainId).all<EventRow>();
   return results;
 }
 

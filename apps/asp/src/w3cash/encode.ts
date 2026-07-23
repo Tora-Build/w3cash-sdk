@@ -1478,17 +1478,27 @@ function computeAutoExpiry(
   if (now === undefined) return null; // no time source → cannot bound
   if (actions.length === 0) return null; // nothing to guard
 
+  // Clamp any summed endTime into uint256 range. Each operand is toUint-bounded, but a sum
+  // (now + secs, latest + grace) can still exceed 2^256-1; without this, encodeAbiParameters
+  // throws IntegerOutOfRangeError, which the server surfaces as a 500 (INTERNAL) instead of a 400.
+  // An expiry past the u256 range is semantically infinite, so clamping keeps the request valid
+  // (round-4 audit).
+  const clampU256 = (v: bigint): bigint => (v > UINT_MAX.u256 ? UINT_MAX.u256 : v);
+
+  // Explicit numeric window is the caller's OWN expiry — honor it even when a non-recurring
+  // timeRange is also present. Both gates then apply on-chain (AND semantics), so the tighter
+  // bound wins. This branch previously sat BELOW the timeRange check, so an explicit expiry:<secs>
+  // was silently dropped and the `!autoExpiry` warning misattributed the cause (round-4 audit).
+  if (expiryOpt !== undefined && expiryOpt !== "auto") {
+    const secs = toUint(expiryOpt, "expiry", UINT_MAX.u256);
+    return { endTime: clampU256(now + secs), className: "custom" };
+  }
+
   // An explicit absolute (non-recurring) timeRange IS the caller's own expiry.
   const hasAbsoluteWindow = conditions.some(
     (c) => c && c.type === "timeRange" && c.recurring === false
   );
   if (hasAbsoluteWindow) return null;
-
-  // Explicit numeric window overrides classification.
-  if (expiryOpt !== undefined && expiryOpt !== "auto") {
-    const secs = toUint(expiryOpt, "expiry", UINT_MAX.u256);
-    return { endTime: now + secs, className: "custom" };
-  }
 
   const has = (t: string): boolean =>
     conditions.some((c) => c && c.type === t);
@@ -1508,7 +1518,7 @@ function computeAutoExpiry(
   if (waitTimes.length > 0) {
     const latest = waitTimes.reduce((a, b) => (b > a ? b : a), 0n);
     return {
-      endTime: latest + EXPIRY_WINDOWS.scheduledGrace,
+      endTime: clampU256(latest + EXPIRY_WINDOWS.scheduledGrace),
       className: "scheduled",
     };
   }
@@ -1522,10 +1532,23 @@ function computeAutoExpiry(
     has("gasPrice") ||
     has("waitBlock")
   ) {
-    return { endTime: now + EXPIRY_WINDOWS.triggered, className: "triggered" };
+    return { endTime: clampU256(now + EXPIRY_WINDOWS.triggered), className: "triggered" };
   }
   // No trigger conditions — fire immediately, short window.
-  return { endTime: now + EXPIRY_WINDOWS.immediate, className: "immediate" };
+  return { endTime: clampU256(now + EXPIRY_WINDOWS.immediate), className: "immediate" };
+}
+
+/**
+ * Render unix-seconds as ISO, or a sentinel beyond the JS Date range (~8.64e12 s / year 275760).
+ * `new Date(ms).toISOString()` throws RangeError past that; the u256 clamp caps ~28 orders of
+ * magnitude higher, so it does NOT prevent this — without the guard an absurd expiry surfaces as a
+ * 500 INTERNAL instead of a clean 200 (round-5 audit). Used at both expiry-summary call sites.
+ */
+const DATE_MAX_SECONDS = 8_640_000_000_000n; // JS Date ceiling 8.64e15 ms → 8.64e12 s
+function isoOrUnbounded(secs: bigint): string {
+  return secs <= DATE_MAX_SECONDS
+    ? new Date(Number(secs) * 1000).toISOString()
+    : "beyond representable date (effectively unbounded)";
 }
 
 /** Build the timeRange EncodedStep for an auto-expiry (startTime 0, end inclusive). */
@@ -1535,7 +1558,7 @@ function encodeAutoExpiry(exp: AutoExpiry, cfg: ChainConfig): EncodedStep {
     exp.endTime,
     false,
   ]);
-  const iso = new Date(Number(exp.endTime) * 1000).toISOString();
+  const iso = isoOrUnbounded(exp.endTime);
   const unbounded = exp.className === "market";
   return {
     input,
@@ -1577,7 +1600,9 @@ function computeExposure(actions: ActionRequest[]): TokenExposure[] {
         break;
       case "approve": {
         const amt = toBigInt(a.amount, "approve.amount");
-        add(a.token, amt, amt >= UINT_MAX.u256);
+        // 2^128 base units dwarfs any real token supply, so flag a near-max approval as UNLIMITED
+        // too — not only the exact uint256 max (round-5 audit).
+        add(a.token, amt, amt >= 1n << 128n);
         break;
       }
       case "swap":
@@ -1775,9 +1800,9 @@ export function compileIntent(request: CompileRequest): CompiledIntent {
   }
   humanSummary.push(
     autoExpiry
-      ? `Expiry: valid until unix ${autoExpiry.endTime.toString()} (${new Date(
-          Number(autoExpiry.endTime) * 1000
-        ).toISOString()}), class=${autoExpiry.className}. Bounds signature replay.`
+      ? `Expiry: valid until unix ${autoExpiry.endTime.toString()} (${isoOrUnbounded(
+          autoExpiry.endTime
+        )}), class=${autoExpiry.className}. Bounds signature replay.`
       : `Expiry: NONE — signature never time-expires; cancel via incrementNonce().`
   );
   if (exposure.length > 0) {

@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS cursors (
 );
 
 -- Compile-time intent metadata (the "your intents" linkage). Optional: populated by the ASP's
--- best-effort POST /record at compile time. Everything here is already public in the calldata.
+-- best-effort POST /record at compile time. `summary` is ASP-supplied free text and is NEVER
+-- returned by the unauthenticated read endpoints; payload_hash/chain_id/initiator only become
+-- public once an intent executes on-chain. Nothing secret (keys/signatures) is stored here.
 CREATE TABLE IF NOT EXISTS intents (
   payload_hash TEXT    NOT NULL,
   chain_id     INTEGER NOT NULL,
