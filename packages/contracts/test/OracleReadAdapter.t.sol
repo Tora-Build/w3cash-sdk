@@ -169,6 +169,28 @@ contract OracleReadAdapterTest is Test {
         reader.pythFreshPrice(address(pyth), bytes32(0), 3600);
     }
 
+    /// Audit F10: pythPrice now enforces a valid publish time (a zero/uninitialized time reverts).
+    function test_AuditF10_PythPrice_RequiresValidTime() public {
+        MockPyth pyth = new MockPyth(int64(12345), 0); // uninitialized publishTime
+        vm.expectRevert(OracleReadAdapter.InvalidUpdateTime.selector);
+        reader.pythPrice(address(pyth), bytes32(0));
+    }
+
+    /// Audit F10: the expo-aware scaled reader normalizes to target decimals (expo -8 -> 8 dp).
+    function test_AuditF10_PythPriceScaled_AppliesExpo() public {
+        // mantissa 3000_0000_0000 (3e11) with expo -8 == $3000; scaled to 8 dp == 3000e8.
+        MockPyth pyth = new MockPyth(int64(3000_0000_0000), block.timestamp);
+        assertEq(reader.pythPriceScaled(address(pyth), bytes32(0), 8, 3600), 3000e8);
+    }
+
+    /// Audit F11: chainlinkPriceScaled that would truncate a non-zero price to 0 reverts.
+    function test_AuditF11_ChainlinkScaled_RevertsOnUnderflow() public {
+        // $0.30 on an 8-dec feed (3e7); scaling to 0 decimals => 3e7/1e8 = 0 -> ScaleUnderflow.
+        MockAggregator feed = new MockAggregator(1, 3e7, block.timestamp, 8);
+        vm.expectRevert(OracleReadAdapter.ScaleUnderflow.selector);
+        reader.chainlinkPriceScaled(address(feed), 0);
+    }
+
     // --- Integration: QueryAdapter reads the reader correctly ------------
 
     /// @dev The whole point: a `query` gate that targets OracleReadAdapter.

@@ -86,6 +86,8 @@ contract OracleReadAdapter {
     error StalePrice();
     /// @notice Rescale exponent exceeds a sane bound (would overflow uint256).
     error ScaleOverflow();
+    /// @notice A non-zero price truncated to 0 under the requested down-scale (audit F11).
+    error ScaleUnderflow();
 
     // ---------------------------------------------------------------------
     // Chainlink
@@ -154,7 +156,11 @@ contract OracleReadAdapter {
         }
         uint256 down = uint256(feedDecimals - targetDecimals);
         if (down > 77) revert ScaleOverflow();
-        return price / (10 ** down);
+        uint256 r = price / (10 ** down);
+        // A non-zero price that truncates to 0 (targetDecimals too coarse) would feed a misleading 0
+        // into the gate comparison (audit F11) — surface it as a failed read instead.
+        if (r == 0 && price != 0) revert ScaleUnderflow();
+        return r;
     }
 
     // ---------------------------------------------------------------------
@@ -196,14 +202,46 @@ contract OracleReadAdapter {
     // ---------------------------------------------------------------------
 
     /**
-     * @notice Latest Pyth price for `id` as uint256, from `getPriceUnsafe`. Reverts on
-     * a negative price. NOTE: unsafe = no on-read staleness check; pair with
-     * `pythFreshPrice` (or a separate age gate) when freshness matters.
+     * @notice Latest Pyth MANTISSA for `id`, with a valid-time check (audit F10). Reverts on a
+     * negative price or a zero/future publishTime.
+     * @dev WARNING: this returns the raw mantissa and DISCARDS the exponent (`expo`), so a threshold
+     * compared against it must be in the SAME mantissa units — do NOT gate a human price (e.g. 3000)
+     * against it. For a decimals-normalized, freshness-bounded price gate use `pythPriceScaled`; the
+     * SDK should emit that for price conditions.
      */
     function pythPrice(address pyth, bytes32 id) external view returns (uint256) {
         IPyth.Price memory p = IPyth(pyth).getPriceUnsafe(id);
+        _requireValidTime(p.publishTime); // F10: was missing any freshness/validity check
         if (p.price < 0) revert NegativeAnswer();
         return uint256(uint64(p.price));
+    }
+
+    /**
+     * @notice Pyth price for `id` normalized to `targetDecimals`, fresh within `maxAge` (audit F10).
+     * Applies the feed's own `expo` so the returned value is comparable to a human-scaled threshold.
+     */
+    function pythPriceScaled(address pyth, bytes32 id, uint8 targetDecimals, uint256 maxAge)
+        external
+        view
+        returns (uint256)
+    {
+        IPyth.Price memory p = IPyth(pyth).getPriceUnsafe(id);
+        _requireValidTime(p.publishTime);
+        if (block.timestamp - p.publishTime > maxAge) revert StalePrice();
+        if (p.price < 0) revert NegativeAnswer();
+        uint256 mant = uint256(uint64(p.price));
+        // Pyth price = mant * 10^expo. Target = mant * 10^(targetDecimals + expo).
+        int256 exp = int256(uint256(uint8(targetDecimals))) + int256(p.expo);
+        if (exp >= 0) {
+            uint256 up = uint256(exp);
+            if (up > 77) revert ScaleOverflow();
+            return mant * (10 ** up);
+        }
+        uint256 down = uint256(-exp);
+        if (down > 77) revert ScaleOverflow();
+        uint256 r = mant / (10 ** down);
+        if (r == 0 && mant != 0) revert ScaleUnderflow();
+        return r;
     }
 
     /**

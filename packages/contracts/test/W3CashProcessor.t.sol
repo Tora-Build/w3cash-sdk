@@ -183,6 +183,7 @@ contract W3CashProcessorTest is Test {
     address internal sessionKey;
     uint256 internal sessPk;
     address internal TOKEN;
+    bytes[] internal NO_SIGS; // empty Permit2 fundingSigs for non-PERMIT2 intents
 
     function setUp() public {
         vm.warp(1_000_000);
@@ -285,7 +286,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 1000, 0, 600, 1, 0);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spent, 600);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 1);
@@ -298,7 +299,7 @@ contract W3CashProcessorTest is Test {
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 1000, 0, 600, 1, 0);
         uint256 rootBefore = erc.balanceOf(root);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         assertEq(erc.balanceOf(root), rootBefore - 600);   // pulled from root
         assertEq(erc.balanceOf(address(action)), 600);      // pushed to the adapter
         assertEq(erc.balanceOf(address(proc)), 0);          // processor holds nothing after
@@ -307,15 +308,18 @@ contract W3CashProcessorTest is Test {
     function test_Permit2Funding_PullsViaPermit2() public {
         W3CashProcessor.Policy memory p = _policy(1000, 0);
         W3CashProcessor.SessionGrant memory g = _grant(keccak256(abi.encode(p)));
-        // gate + a PERMIT2-funded action; fundingParams carries (nonce, deadline, sig).
+        // gate + a PERMIT2-funded action; fundingParams carries (nonce, deadline) ONLY — the sig is a
+        // SEPARATE execute() arg (audit F6) so it isn't inside opsHash (which the witness depends on).
         W3CashProcessor.Op[] memory ops = new W3CashProcessor.Op[](2);
         ops[0] = _gateOp(true);
         W3CashProcessor.Op memory a = _actionOp(W3CashProcessor.FundingMode.PERMIT2, 600);
-        a.fundingParams = abi.encode(uint256(1), block.timestamp + 1 days, bytes("sig"));
+        a.fundingParams = abi.encode(uint256(1), block.timestamp + 1 days);
         ops[1] = a;
         W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
+        bytes[] memory sigs = new bytes[](1);
+        sigs[0] = bytes("permit2-sig"); // the mock Permit2 ignores it; a real one recovers the witness
         proc.execute(
-            g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it))
+            g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), sigs
         );
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spent, 600);
@@ -357,7 +361,7 @@ contract W3CashProcessorTest is Test {
         });
         W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
 
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
 
         (uint128 spentToken, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spentToken, 600);               // only the root-sourced input counts
@@ -371,7 +375,7 @@ contract W3CashProcessorTest is Test {
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(false, 1000, 0, 600, 1, 0);
         uint256 rootBefore = erc.balanceOf(root);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spent, 0);
         assertEq(erc.balanceOf(root), rootBefore); // no pull on the pause path
@@ -387,7 +391,7 @@ contract W3CashProcessorTest is Test {
         sessSig = _sign(sessPk, proc.intentDigest(it));
         W3CashProcessor.Policy memory wideOpen = _policy(type(uint128).max, 0);
         vm.expectRevert(W3CashProcessor.PolicyMismatch.selector);
-        proc.execute(g, rootSig, wideOpen, it, ops, sessSig);
+        proc.execute(g, rootSig, wideOpen, it, ops, sessSig, NO_SIGS);
     }
 
     function test_OpKindOrdering_ActionBeforeGate_Reverts() public {
@@ -398,7 +402,7 @@ contract W3CashProcessorTest is Test {
         bytes memory rootSig = _sign(rootPk, proc.grantDigest(g)); // precompute before expectRevert
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
         vm.expectRevert(W3CashProcessor.OpsNotOrdered.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_EpochCancelAll_Reverts() public {
@@ -407,7 +411,7 @@ contract W3CashProcessorTest is Test {
         ) = _bundle(true, 1000, 0, 600, 1, 0);
         vm.prank(root); proc.incrementEpoch();
         vm.expectRevert(W3CashProcessor.WrongEpoch.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_RevokeSession_Reverts() public {
@@ -416,17 +420,17 @@ contract W3CashProcessorTest is Test {
         ) = _bundle(true, 1000, 0, 600, 1, 0);
         vm.prank(root); proc.revokeSession(g);
         vm.expectRevert(W3CashProcessor.SessionRevoked.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_AbsoluteCap_Exceeds() public {
         ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 1000, 0, 600, 0, 1);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         vm.warp(block.timestamp + 2);
         vm.expectRevert(W3CashProcessor.CapExceeded.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_RollingWindow_ResetsAfterPeriod() public {
@@ -434,14 +438,14 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 1000, win, 600, 0, 60);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         (uint128 s1, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(s1, 600);
         vm.warp(block.timestamp + 61);
         vm.expectRevert(W3CashProcessor.CapExceeded.selector); // within window: 1200 > 1000
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         vm.warp(block.timestamp + win + 1); // past the window: resets
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         (uint128 s2, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(s2, 600);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 2);
@@ -451,9 +455,9 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, bytes memory rootSig, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 2000, 0, 600, 0, 1);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         vm.warp(block.timestamp + 2);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 2);
     }
 
@@ -494,7 +498,7 @@ contract W3CashProcessorTest is Test {
         });
         W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
 
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
 
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spent, 0);                            // cap untouched — the flash never pulled root
@@ -545,7 +549,7 @@ contract W3CashProcessorTest is Test {
         });
         W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
 
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
 
         assertEq(sink.received(), 500);            // native forwarded from the frame (msg.value was 0)
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
@@ -568,7 +572,7 @@ contract W3CashProcessorTest is Test {
         bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
         vm.expectRevert(W3CashProcessor.PermitRecurring.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_Item9_MinResetFloor_Reverts() public {
@@ -577,7 +581,7 @@ contract W3CashProcessorTest is Test {
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops, bytes memory sessSig
         ) = _bundle(true, 1000, 60, 600, 0, 1);
         vm.expectRevert(W3CashProcessor.ResetTooShort.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_Item9_CancelIntent_RootCancels() public {
@@ -587,7 +591,7 @@ contract W3CashProcessorTest is Test {
         vm.prank(root);
         proc.cancelIntent(g, it);
         vm.expectRevert(W3CashProcessor.Cancelled.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     function test_Item9_CancelIntent_StrangerRejected() public {
@@ -640,7 +644,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
             _tipBundle(address(tip), 50, keeper);
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         assertEq(tip.balanceOf(keeper), 50);
         (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
         assertEq(tipSpent, 50);
@@ -653,7 +657,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
             _tipBundle(address(tip), 50, address(0)); // open bounty => msg.sender
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         assertEq(tip.balanceOf(address(this)), 50); // this test contract is the relayer
     }
 
@@ -664,7 +668,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
             _tipBundle(address(tip), 50, address(0xBEEF));
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         assertEq(tip.balanceOf(address(0xBEEF)), 0);        // tip not paid
         (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
         assertEq(tipSpent, 0);                              // reserve refunded (item 10)
@@ -680,7 +684,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
             _tipBundle(address(tip), 50, address(0xBEEF));
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         (uint128 tipSpent, ) = proc.spentByToken(proc.grantDigest(g), address(tip));
         assertEq(tipSpent, 0);                                  // reserve refunded (dirty return => not paid)
         assertEq(proc.executionsOf(proc.intentDigest(it)), 1);  // protective action still ran
@@ -699,7 +703,7 @@ contract W3CashProcessorTest is Test {
             epoch: proc.epoch(root), salt: keccak256("tip-shared"),
             tipToken: TOKEN, tipAmount: 50, keeperOfRecord: keeper
         });
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         (uint128 spent, ) = proc.spentByToken(proc.grantDigest(g), TOKEN);
         assertEq(spent, 650);              // 600 action + 50 tip, ONE shared cursor (not 2x)
         assertEq(erc.balanceOf(keeper), 50);
@@ -744,7 +748,7 @@ contract W3CashProcessorTest is Test {
 
         uint256 rootBefore = erc.balanceOf(root);
         vm.expectRevert(); // PostConditionFailed bubbles up, unwinding the whole intent
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         assertEq(erc.balanceOf(root), rootBefore);              // the prior action's pull was unwound
         assertEq(proc.executionsOf(proc.intentDigest(it)), 0);  // nothing committed
     }
@@ -780,7 +784,7 @@ contract W3CashProcessorTest is Test {
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
 
         vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     /// Flash-frame proof: exactly ONE sub-group per frame — a second onFlashLoan reverts.
@@ -818,7 +822,7 @@ contract W3CashProcessorTest is Test {
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
 
         vm.expectRevert(W3CashProcessor.FlashSlotConsumed.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     /// Flash-frame proof: a sub-op cannot draw more than the borrowed principal (frame-bounded).
@@ -856,7 +860,7 @@ contract W3CashProcessorTest is Test {
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
 
         vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     /// A hostile tip token whose transferFrom reverts must NOT brick the protective action.
@@ -866,7 +870,7 @@ contract W3CashProcessorTest is Test {
         ( W3CashProcessor.SessionGrant memory g, W3CashProcessor.Policy memory p,
           W3CashProcessor.Intent memory it, W3CashProcessor.Op[] memory ops ) =
             _tipBundle(address(tip), 50, address(0xBEEF));
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 1); // action ran; tip skipped
     }
 
@@ -906,7 +910,7 @@ contract W3CashProcessorTest is Test {
             funding: W3CashProcessor.FundingMode.NONE, fundToken: address(0), fundAmount: 0, outToken: address(0),
             fundingParams: "", data: abi.encode(TOKEN, uint256(1000), bytes(""), abi.encode(sub)) });
         W3CashProcessor.Intent memory it1 = _intent(proc.grantDigest(g1), keccak256(abi.encode(ops1)), 1, 0);
-        proc.execute(g1, _sign(rootPk, proc.grantDigest(g1)), p1, it1, ops1, _sign(sessPk, proc.intentDigest(it1)));
+        proc.execute(g1, _sign(rootPk, proc.grantDigest(g1)), p1, it1, ops1, _sign(sessPk, proc.intentDigest(it1)), NO_SIGS);
 
         // --- intent 2 (SAME tx): a THREADED draw of TOKEN must revert — frame was zeroed ---
         MockAction sink = new MockAction(1 << 1);
@@ -922,7 +926,7 @@ contract W3CashProcessorTest is Test {
         bytes memory rs2 = _sign(rootPk, proc.grantDigest(g2));
         bytes memory ss2 = _sign(sessPk, proc.intentDigest(it2));
         vm.expectRevert(W3CashProcessor.InsufficientFrameBalance.selector);
-        proc.execute(g2, rs2, p2, it2, ops2, ss2);
+        proc.execute(g2, rs2, p2, it2, ops2, ss2, NO_SIGS);
     }
 
     /// Conformance: the Permit2 witness type string is canonical (item 12). A real Permit2
@@ -962,7 +966,7 @@ contract W3CashProcessorTest is Test {
         bytes memory rootSig = _sign(ownerPk, proc.grantDigest(g));
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
 
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         assertEq(proc.executionsOf(proc.intentDigest(it)), 1);
         assertEq(erc.balanceOf(address(action)), 600); // funds pulled from the smart-account root
     }
@@ -984,7 +988,7 @@ contract W3CashProcessorTest is Test {
         });
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
         vm.expectRevert(W3CashProcessor.BadRootSig.selector);
-        proc.execute(g, "0x", p, it, ops, sessSig);
+        proc.execute(g, "0x", p, it, ops, sessSig, NO_SIGS);
     }
 
     // ======================================================================
@@ -1016,7 +1020,7 @@ contract W3CashProcessorTest is Test {
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
 
         vm.expectRevert(W3CashProcessor.RepayShortfall.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
         assertEq(erc.balanceOf(address(proc)), 5000); // resident balance untouched
     }
 
@@ -1044,7 +1048,7 @@ contract W3CashProcessorTest is Test {
             funding: W3CashProcessor.FundingMode.THREADED, fundToken: address(erc2), fundAmount: 600, outToken: address(0), fundingParams: "", data: "" }); // draws only 600 of 1000
         W3CashProcessor.Intent memory it = _intent(proc.grantDigest(g), keccak256(abi.encode(ops)), 1, 0);
 
-        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)));
+        proc.execute(g, _sign(rootPk, proc.grantDigest(g)), p, it, ops, _sign(sessPk, proc.intentDigest(it)), NO_SIGS);
         assertEq(erc2.balanceOf(root), 400);            // 1000 output - 600 drawn = 400 swept to root
         assertEq(erc2.balanceOf(address(proc)), 0);     // nothing stranded
     }
@@ -1065,7 +1069,7 @@ contract W3CashProcessorTest is Test {
         bytes memory rootSig = _sign(rootPk, proc.grantDigest(g));
         bytes memory sessSig = _sign(sessPk, proc.intentDigest(it));
         vm.expectRevert(W3CashProcessor.PolicyDenied.selector);
-        proc.execute(g, rootSig, p, it, ops, sessSig);
+        proc.execute(g, rootSig, p, it, ops, sessSig, NO_SIGS);
     }
 
     /// F8: a leaked session key can NO LONGER permanently cancel a protective intent (root-only).

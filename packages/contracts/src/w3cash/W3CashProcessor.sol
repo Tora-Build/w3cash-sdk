@@ -166,7 +166,7 @@ contract W3CashProcessor is EIP712 {
         address     fundToken;   // token pulled/threaded (address(0)=native)
         uint128     fundAmount;  // input amount; == type(uint128).max + THREADED = draw-all (CONTRACT_BALANCE)
         address     outToken;    // single output register the adapter returns to the processor
-        bytes       fundingParams; // PERMIT2: abi.encode(nonce,deadline,sig); else empty
+        bytes       fundingParams; // PERMIT2: abi.encode(nonce,deadline); else empty (sig is a separate execute arg — F6)
         bytes       data;        // adapter calldata
     }
 
@@ -232,7 +232,8 @@ contract W3CashProcessor is EIP712 {
         Policy calldata policy,     // preimage; hash-checked vs g.policyHash
         Intent calldata it,
         Op[] calldata ops,          // preimage; hash-checked vs it.opsHash
-        bytes calldata sessionSig
+        bytes calldata sessionSig,
+        bytes[] calldata fundingSigs // Permit2 sigs, in PERMIT2-op order; EXCLUDED from opsHash (audit F6)
     ) external payable {
         _enterFrame(); // depth 0 -> 1; blocks uncontrolled re-entry
 
@@ -283,14 +284,18 @@ contract W3CashProcessor is EIP712 {
         // Native forwarded as op.value draws caller ETH (msg.value) FIRST, then frame native
         // (unwrap output) — never a root pull, so it is unmetered (item 8).
         uint256 callerNative = msg.value;
+        uint256 permitIdx;
         for (uint256 i = boundary; i < ops.length; ++i) {
             Op calldata op = ops[i];
             if (op.value != 0) callerNative = _drawNative(op.value, callerNative);
             if (_adapterVerb(op.target) & VERB_FLASH != 0) {
                 _runFlashOp(policy, op, root); // controlled-callback flash sub-group (item 7)
             } else {
+                // A PERMIT2 op consumes the next fundingSig (in order); others use no sig.
+                bytes calldata permitSig = msg.data[0:0];
+                if (op.funding == FundingMode.PERMIT2) { permitSig = fundingSigs[permitIdx]; unchecked { ++permitIdx; } }
                 // Reserve (root-sourced) or draw (threaded) the input; returns the amount to push.
-                uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest);
+                uint256 fed = _reserveAndFund(gDigest, policy, op, root, iDigest, permitSig);
                 _feedAndRun(op, root, fed);
             }
         }
@@ -452,6 +457,9 @@ contract W3CashProcessor is EIP712 {
                     } else if (op.funding == FundingMode.NONE && op.fundToken != address(0)) {
                         revert PolicyDenied();
                     }
+                    // A post-condition (assert) adapter moves no funds; forwarding native to it would
+                    // strand (it never spends/refunds op.value) (audit F4 belt-and-suspenders).
+                    if (v & VERB_ASSERT != 0 && op.value != 0) revert PolicyDenied();
                 }
                 // Native op.value is caller/frame-supplied (never a root pull) => NOT cap-metered (item 8).
             }
@@ -481,7 +489,7 @@ contract W3CashProcessor is EIP712 {
     /// @dev Provide the input for an ACTION op and return the amount now held by the processor and
     /// ready to push to the adapter. THREADED draws the per-frame ledger (never counts vs the cap);
     /// PERMIT2/STANDING reserve the cap BEFORE pulling root funds into the processor.
-    function _reserveAndFund(bytes32 gDigest, Policy calldata p, Op calldata op, address root, bytes32 iDigest)
+    function _reserveAndFund(bytes32 gDigest, Policy calldata p, Op calldata op, address root, bytes32 iDigest, bytes calldata permitSig)
         internal
         returns (uint256 fed)
     {
@@ -498,29 +506,28 @@ contract W3CashProcessor is EIP712 {
 
         // ROOT-sourced: reserve the cap (upper bound) RIGHT BEFORE the pull, then pull into self.
         _reserveCap(gDigest, p, op.fundToken, op.fundAmount, iDigest);
-        fed = _pullRoot(op, root, iDigest); // measured received (FoT-safe): push exactly what arrived
+        fed = _pullRoot(op, root, iDigest, permitSig); // measured received (FoT-safe): push exactly what arrived
     }
 
     /// @dev Pull `fundAmount` of `fundToken` from `root` INTO the processor and return the MEASURED
     /// received amount. STANDING = a standing approve-to-processor allowance; PERMIT2 = a witness-
     /// bound SignatureTransfer (processor is the sole spender). The adapter never pulls from root.
-    function _pullRoot(Op calldata op, address root, bytes32 iDigest) internal returns (uint256 received) {
+    function _pullRoot(Op calldata op, address root, bytes32 iDigest, bytes calldata permitSig) internal returns (uint256 received) {
         IERC20 t = IERC20(op.fundToken);
         uint256 balBefore = t.balanceOf(address(this));
         if (op.funding == FundingMode.STANDING) {
             t.safeTransferFrom(root, address(this), op.fundAmount);
         } else {
-            _permit2Pull(op, root, iDigest);
+            _permit2Pull(op, root, iDigest, permitSig);
         }
         received = t.balanceOf(address(this)) - balBefore; // FoT-safe
     }
 
     /// @dev Witness-bound Permit2 SignatureTransfer, witness = the intent digest (binds the pull to
-    /// THIS intent). fundingParams = abi.encode(nonce, deadline, signature).
-    /// NOTE(freeze): the exact WITNESS_TYPESTRING is a per-chain release-gate golden vector (item 12).
-    function _permit2Pull(Op calldata op, address root, bytes32 iDigest) internal {
-        (uint256 nonce, uint256 deadline, bytes memory sig) =
-            abi.decode(op.fundingParams, (uint256, uint256, bytes));
+    /// THIS intent). fundingParams = abi.encode(nonce, deadline); the SIGNATURE is passed separately
+    /// (audit F6 — a sig inside fundingParams would enter opsHash → the witness=iDigest is circular).
+    function _permit2Pull(Op calldata op, address root, bytes32 iDigest, bytes calldata sig) internal {
+        (uint256 nonce, uint256 deadline) = abi.decode(op.fundingParams, (uint256, uint256));
         ISignatureTransfer(permit2).permitWitnessTransferFrom(
             ISignatureTransfer.PermitTransferFrom({
                 permitted: ISignatureTransfer.TokenPermissions({ token: op.fundToken, amount: op.fundAmount }),
@@ -542,21 +549,21 @@ contract W3CashProcessor is EIP712 {
         if (op.fundToken != address(0) && op.fundToken != NATIVE && fed > 0) {
             IERC20(op.fundToken).safeTransfer(op.target, fed);
         }
-        // Output register: NATIVE => measure the native balance delta (unwrap output); an ERC20
-        // outToken => measure its balanceOf delta; address(0) => no output register.
-        uint256 outBefore;
-        if (op.outToken == NATIVE) outBefore = address(this).balance;
-        else if (op.outToken != address(0)) outBefore = IERC20(op.outToken).balanceOf(address(this));
+        // ALWAYS measure native around run() (audit F4): any native the adapter returns is credited
+        // to the frame (then swept), regardless of outToken, so it can never strand. A separate ERC20
+        // output register (outToken != 0/NATIVE) is measured too.
+        uint256 nativeBefore = address(this).balance;
+        uint256 ercBefore = (op.outToken != address(0) && op.outToken != NATIVE)
+            ? IERC20(op.outToken).balanceOf(address(this)) : 0;
 
         IActionAdapter(op.target).run{ value: op.value }(root, op.data);
 
-        if (op.outToken == NATIVE) {
-            // `received = balAfter + op.value - balBefore` (op.value left during the call).
-            uint256 balAfter = address(this).balance + op.value;
-            if (balAfter > outBefore) _frameCredit(NATIVE, balAfter - outBefore);
-        } else if (op.outToken != address(0)) {
-            uint256 outAfter = IERC20(op.outToken).balanceOf(address(this));
-            if (outAfter > outBefore) _frameCredit(op.outToken, outAfter - outBefore);
+        // received native = balAfter + op.value(sent out during the call) - balBefore
+        uint256 nativeAfter = address(this).balance + op.value;
+        if (nativeAfter > nativeBefore) _frameCredit(NATIVE, nativeAfter - nativeBefore);
+        if (op.outToken != address(0) && op.outToken != NATIVE) {
+            uint256 ercAfter = IERC20(op.outToken).balanceOf(address(this));
+            if (ercAfter > ercBefore) _frameCredit(op.outToken, ercAfter - ercBefore);
         }
     }
 
